@@ -20,8 +20,26 @@ import mlx.core as mx
 
 _splitk_cache: dict[tuple, tuple] = {}
 
-# Default split size — tokens per split. Tuned for Apple Silicon occupancy.
-DEFAULT_SPLIT_SIZE = 256
+# Base split size — tokens per split. Adaptive: grows with context length
+# to keep num_splits ≤ 16, avoiding reduce kernel bottleneck at long contexts.
+_BASE_SPLIT_SIZE = 256
+_MAX_SPLITS = 16
+
+
+def optimal_split_size(s_total: int) -> int:
+    """Compute split size that keeps num_splits capped at _MAX_SPLITS.
+
+    At short contexts (≤4K): split_size=256, num_splits=1-16 (fine).
+    At long contexts: split_size grows to keep reduce overhead constant.
+    """
+    if s_total <= _BASE_SPLIT_SIZE * _MAX_SPLITS:
+        return _BASE_SPLIT_SIZE
+    # Round up to multiple of 256 for alignment
+    return ((s_total + _MAX_SPLITS - 1) // _MAX_SPLITS + 255) // 256 * 256
+
+
+# Keep for backward compat
+DEFAULT_SPLIT_SIZE = _BASE_SPLIT_SIZE
 
 # Max overrides per KV head. Background worker writes promoted fp16 K,V here;
 # the Metal kernel reads from this buffer instead of dequanting INT8/INT4.
@@ -446,7 +464,7 @@ def foveated_attention_metal(
     far_k, far_v, far_k_scale, far_k_zero,
     far_v_scale, far_v_zero,
     spike_margin: float = 0.5,
-    split_size: int = DEFAULT_SPLIT_SIZE,
+    split_size: int = None,
     decode_k: mx.array = None,
     decode_v: mx.array = None,
     foveal_valid: mx.array = None,
@@ -475,6 +493,9 @@ def foveated_attention_metal(
     )
 
     total_bh_q = B * H_q
+    n_decode = decode_k.shape[2] if decode_k is not None else 0
+    if split_size is None:
+        split_size = optimal_split_size(N_fov + N_per + N_far + n_decode)
 
     return _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
                        spike_margin, total_bh_q, split_size,

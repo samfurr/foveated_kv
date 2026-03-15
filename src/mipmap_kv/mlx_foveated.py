@@ -175,7 +175,7 @@ class MLXFoveatedLayer:
         """Build kernel cache on first call. Caches static inputs + kernels."""
         if self._kcache is not None:
             return
-        from .metal_foveated import _get_splitk_kernels, DEFAULT_SPLIT_SIZE, MAX_OV
+        from .metal_foveated import _get_splitk_kernels, optimal_split_size, MAX_OV
 
         B = self.foveal_k.shape[0]
         H_kv = self.foveal_k.shape[1]
@@ -214,7 +214,7 @@ class MLXFoveatedLayer:
         self._kcache = {
             'B': B, 'H_kv': H_kv, 'D': D,
             'N_fov': N_fov, 'N_per': N_per, 'N_far': N_far,
-            'split_size': DEFAULT_SPLIT_SIZE,
+            'N_static': N_fov + N_per + N_far,  # for adaptive split_size
             'static': static,
             'zero_ov': (zero_ov_k, zero_ov_v, zero_ov_idx, zero_ov_cnt),
             'empty_decode': (empty_dk, empty_dv),
@@ -227,22 +227,27 @@ class MLXFoveatedLayer:
         Skips foveated_attention_metal → _prepare_inputs → _run_splitk.
         Returns (output, spike_flags, spike_tokens).
         """
-        from .metal_foveated import _get_splitk_kernels
+        from .metal_foveated import _get_splitk_kernels, optimal_split_size
 
         self._ensure_kcache()
         c = self._kcache
         B, H_kv, D = c['B'], c['H_kv'], c['D']
         N_fov, N_per, N_far = c['N_fov'], c['N_per'], c['N_far']
-        split_size = c['split_size']
         H_q = query.shape[1]
         total_bh_q = B * H_q
 
-        # Get or cache kernels for this H_q
-        if H_q not in c['kernels']:
-            c['kernels'][H_q] = _get_splitk_kernels(
+        # Adaptive split size based on total tokens (including decode buffer)
+        dk_temp = self.decode_k
+        n_dec = dk_temp.shape[2] if dk_temp is not None else 0
+        split_size = optimal_split_size(c['N_static'] + n_dec)
+
+        # Get or cache kernels for this (H_q, split_size) combo
+        kernel_key = (H_q, split_size)
+        if kernel_key not in c['kernels']:
+            c['kernels'][kernel_key] = _get_splitk_kernels(
                 N_fov, N_per, N_far, D, H_q, H_kv, 0.5, split_size,
             )
-        sk_kernel, red_kernel = c['kernels'][H_q]
+        sk_kernel, red_kernel = c['kernels'][kernel_key]
 
         # Dynamic: query
         q_flat = query.reshape(total_bh_q, D)

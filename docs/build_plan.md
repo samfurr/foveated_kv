@@ -94,18 +94,22 @@ scripts/
 | Kernel speed (32K, original) | 3.28x |
 | Ablation: asymmetric K/V | 130x error without it |
 
-## Kernel Latency (7B shapes: H_kv=4, H_q=16, D=128, single layer)
+## Kernel Latency (7B shapes: H_kv=4, H_q=16, D=128, single layer, 100 iters)
 
 | Context | fp16 SDPA | Fused Kernel | Speedup |
 |---------|-----------|-------------|---------|
-| 512 | 364ms | 173ms | 2.11x |
-| 1,024 | 340ms | 227ms | 1.50x |
-| 2,048 | 457ms | 261ms | 1.75x |
-| 4,096 | 400ms | 236ms | 1.70x |
-| 8,192 | 217ms | 202ms | 1.08x |
-| 16,384 | 311ms | 198ms | 1.57x |
+| 1,024 | 7.5ms | 7.5ms | 1.0x |
+| 4,096 | 7.8ms | 7.7ms | 1.0x |
+| 16,384 | 9.4ms | 7.8ms | 1.2x |
+| 32,768 | 75.1ms | 8.4ms | **8.9x** |
+| 65,536 | 83.4ms | 16.1ms | **5.2x** |
+| 131,072 | 271.4ms | 26.7ms | **10.2x** |
 
-Fused kernel beats standard fp16 SDPA at ALL context lengths in isolation.
+**Crossover: ~16K tokens.** Below that, break-even. Above, fused dominates
+because Apple's SDPA reads full fp16 KV (bandwidth-bound) while the fused
+kernel reads INT8/INT4 (2-4x fewer bytes per token). Adaptive split_size
+keeps num_splits ≤ 16 to avoid reduce kernel bottleneck at long contexts.
+
 End-to-end decode with a real model adds ~100ms/step Python interceptor overhead
 (24 layers × Python function calls + input validation). A C++ extension would
 eliminate this — blocked on MLX not shipping nanobind type caster headers.

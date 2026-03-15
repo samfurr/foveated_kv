@@ -4,7 +4,6 @@
 #include <vector>
 
 #include "mlx/mlx.h"
-#include "mlx/backend/metal/device.h"
 
 namespace foveated {
 

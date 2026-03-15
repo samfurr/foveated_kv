@@ -327,6 +327,157 @@ _REDUCE_SOURCE = """
 
 
 # ============================================================================
+# Merged Split-K + Reduce kernel — single dispatch via threadgroup shared memory
+# ============================================================================
+
+# Multiple SIMD groups per threadgroup (one per split). Each computes its
+# partial, writes to shared memory, barrier, first SIMD group reduces.
+# Single dispatch, no global partials, no second kernel.
+
+_MERGED_SOURCE = (
+    """
+    uint TOTAL_BH_Q = rt_params[0];
+    uint N_DECODE    = rt_params[1];
+
+    uint bh_q      = threadgroup_position_in_grid.x;
+    uint simd_id   = thread_position_in_threadgroup.x / 32;
+    uint lane_id   = thread_position_in_threadgroup.x % 32;
+    uint split_id  = simd_id;
+
+    uint batch_idx = bh_q / H_Q;
+    uint q_head    = bh_q % H_Q;
+    uint kv_head   = q_head / GQA_RATIO;
+    uint bh_kv = batch_idx * H_KV + kv_head;
+
+    float q_reg[CPT];
+    for (uint c = 0; c < CPT; c++)
+        q_reg[c] = (float)query[bh_q * HEAD_DIM + lane_id * CPT + c];
+
+    // Unpack scale+zero from concatenated buffers: [scale(B,H,D) | zero(B,H,D)]
+    uint sz_stride = H_KV * HEAD_DIM;
+    float pk_s[CPT], pk_z[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        uint d = lane_id * CPT + c;
+        uint base = bh_kv * HEAD_DIM + d;
+        pk_s[c] = (float)periph_k_sz[base];
+        pk_z[c] = (float)periph_k_sz[base + sz_stride];
+    }
+    float fk_s[CPT], fk_z[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        uint d = lane_id * CPT + c;
+        uint base = bh_kv * HEAD_DIM + d;
+        fk_s[c] = (float)far_k_sz[base];
+        fk_z[c] = (float)far_k_sz[base + sz_stride];
+    }
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[CPT];
+    for (uint c = 0; c < CPT; c++) acc[c] = 0.0f;
+    float min_fov_score = INFINITY, max_far_score = -INFINITY;
+    int max_far_token = -1;
+
+    // Compute token range for this SIMD group's split
+    uint S_total = N_FOV + N_PER + N_FAR + N_DECODE;
+    uint gstart  = split_id * SPLIT_SIZE;
+    uint gend    = min(gstart + SPLIT_SIZE, S_total);
+
+    uint fov_start = min(gstart, N_FOV);
+    uint fov_end   = min(gend,   N_FOV);
+    uint per_start = (gstart > N_FOV) ? min(gstart - N_FOV, N_PER) : 0u;
+    uint per_end   = (gend   > N_FOV) ? min(gend   - N_FOV, N_PER) : 0u;
+    uint nfp = N_FOV + N_PER;
+    uint far_start = (gstart > nfp) ? min(gstart - nfp, N_FAR) : 0u;
+    uint far_end   = (gend   > nfp) ? min(gend   - nfp, N_FAR) : 0u;
+    uint nfpf = nfp + N_FAR;
+    uint dec_start = (gstart > nfpf) ? min(gstart - nfpf, N_DECODE) : 0u;
+    uint dec_end   = (gend   > nfpf) ? min(gend   - nfpf, N_DECODE) : 0u;
+
+    // Unpack KV pointers from concatenated buffers.
+    // Use auto to handle constant vs device address space (MLX assigns
+    // small inputs to constant, large to device — we can't predict which).
+    auto foveal_k = foveal_kv;
+    auto foveal_v = foveal_kv + H_KV * N_FOV * HEAD_DIM;
+    auto periph_k = periph_kv;
+    auto periph_v = periph_kv + H_KV * N_PER * HEAD_DIM;
+    auto periph_v_scale = periph_v_sz;
+    auto periph_v_zero  = periph_v_sz + H_KV * N_PER;
+    auto far_v_scale = far_v_sz;
+    auto far_v_zero  = far_v_sz + H_KV * N_FAR;
+    auto decode_k = decode_kv;
+    auto decode_v = decode_kv + H_KV * N_DECODE * HEAD_DIM;
+    auto override_k = override_kv;
+    auto override_v = override_kv + H_KV * MAX_OV * HEAD_DIM;
+"""
+    + _TIER_PROCESSING
+    + """
+    // ---- Write partials to threadgroup shared memory ----
+    // Layout: [NUM_SPLITS] entries, each with: acc[HEAD_DIM] + l + m + min_fov + max_far + far_token
+    threadgroup float shared_acc[NUM_SPLITS * HEAD_DIM];
+    threadgroup float shared_l[NUM_SPLITS];
+    threadgroup float shared_m[NUM_SPLITS];
+    threadgroup float shared_min_fov[NUM_SPLITS];
+    threadgroup float shared_max_far[NUM_SPLITS];
+    threadgroup int   shared_far_tok[NUM_SPLITS];
+
+    for (uint c = 0; c < CPT; c++)
+        shared_acc[split_id * HEAD_DIM + lane_id * CPT + c] = acc[c];
+    if (lane_id == 0) {
+        shared_l[split_id]        = l;
+        shared_m[split_id]        = m;
+        shared_min_fov[split_id]  = min_fov_score;
+        shared_max_far[split_id]  = max_far_score;
+        shared_far_tok[split_id]  = max_far_token;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Reduce: first SIMD group merges all splits ----
+    if (simd_id == 0) {
+        float m_global = -INFINITY, l_global = 0.0f;
+        float racc[CPT];
+        for (uint c = 0; c < CPT; c++) racc[c] = 0.0f;
+        float min_fov = INFINITY, max_far = -INFINITY;
+        int far_token = -1;
+
+        for (uint s = 0; s < NUM_SPLITS; s++) {
+            float m_s = shared_m[s];
+            if (m_s == -INFINITY) continue;
+            float l_s = shared_l[s];
+
+            float m_new = max(m_global, m_s);
+            float ag = (m_global > -INFINITY) ? exp(m_global - m_new) : 0.0f;
+            float as_val = exp(m_s - m_new);
+            l_global = ag * l_global + as_val * l_s;
+            for (uint c = 0; c < CPT; c++) {
+                float pv = shared_acc[s * HEAD_DIM + lane_id * CPT + c];
+                racc[c] = ag * racc[c] + as_val * pv;
+            }
+            m_global = m_new;
+
+            float mf = shared_min_fov[s];
+            min_fov = min(min_fov, mf);
+            float fs = shared_max_far[s];
+            if (fs > max_far) {
+                max_far = fs;
+                far_token = shared_far_tok[s];
+            }
+        }
+
+        // Normalize and write final output
+        float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+        for (uint c = 0; c < CPT; c++)
+            out[bh_q * HEAD_DIM + lane_id * CPT + c] = (half)(racc[c] * inv_l);
+
+        if (lane_id == 0) {
+            spike_flags[bh_q]  = (max_far > min_fov + SPIKE_MARGIN) ? 1 : 0;
+            spike_tokens[bh_q] = far_token;
+        }
+    }
+"""
+)
+
+
+# ============================================================================
 # Kernel builders
 # ============================================================================
 
@@ -423,6 +574,55 @@ def _get_splitk_kernels(n_fov, n_per, n_far, head_dim, h_q, h_kv,
     return _splitk_cache[key]
 
 
+_merged_cache: dict[tuple, object] = {}
+
+
+def _build_merged_kernel(n_fov, n_per, n_far, head_dim, h_q, h_kv,
+                          spike_margin, split_size, num_splits):
+    """Build merged Split-K + Reduce kernel. Single dispatch via shared memory."""
+    assert head_dim % 32 == 0
+    assert h_q % h_kv == 0
+    assert num_splits * 32 <= 1024, f"num_splits={num_splits} exceeds max threadgroup size"
+
+    header = _make_header(
+        n_fov, n_per, n_far, head_dim, h_q, h_kv, spike_margin,
+        SPLIT_SIZE=split_size, NUM_SPLITS=num_splits,
+    )
+    return mx.fast.metal_kernel(
+        name=f"fov_merged_{n_fov}_{n_per}_{n_far}_{head_dim}_{h_q}_{h_kv}_{num_splits}",
+        input_names=[
+            "rt_params",                    # 0: (2,) uint32
+            "query",                        # 1: (BH_q, D) fp16
+            "foveal_kv",                    # 2: K+V concatenated on dim 2
+            "periph_kv",                    # 3: K+V concatenated
+            "periph_k_sz",                  # 4: scale+zero interleaved
+            "periph_v_sz",                  # 5: scale+zero interleaved
+            "far_k",                        # 6: (B,H,N,D) uint8
+            "far_v",                        # 7: (B,H,N,D/2) uint8 — different shape, can't pack
+            "far_k_sz",                     # 8: scale+zero interleaved
+            "far_v_sz",                     # 9: scale+zero interleaved
+            "foveal_valid",                 # 10: (H,) uint32
+            "decode_kv",                    # 11: K+V concatenated
+            "override_kv",                  # 12: K+V concatenated
+            "override_far_idx",             # 13: (H,M) int32
+            "override_count",               # 14: (H,) int32
+        ],
+        output_names=["out", "spike_flags", "spike_tokens"],
+        header=header, source=_MERGED_SOURCE, ensure_row_contiguous=False,
+    )
+
+
+def _get_merged_kernel(n_fov, n_per, n_far, head_dim, h_q, h_kv,
+                        spike_margin, split_size, num_splits):
+    key = (n_fov, n_per, n_far, head_dim, h_q, h_kv, spike_margin, split_size, num_splits)
+    if key not in _merged_cache:
+        _merged_cache[key] = _build_merged_kernel(
+            n_fov, n_per, n_far, head_dim, h_q, h_kv,
+            spike_margin, split_size, num_splits,
+        )
+    return _merged_cache[key]
+
+
 def _prepare_inputs(query, foveal_k, foveal_v,
                     periph_k, periph_v, periph_k_scale, periph_k_zero,
                     periph_v_scale, periph_v_zero,
@@ -510,9 +710,6 @@ def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
                 decode_k=None, decode_v=None,
                 override_k=None, override_v=None,
                 override_far_idx=None, override_count=None):
-    sk_kernel, red_kernel = _get_splitk_kernels(
-        N_fov, N_per, N_far, D, H_q, H_kv, spike_margin, split_size,
-    )
 
     # Decode buffer (4th tier — new tokens since compression)
     n_decode = decode_k.shape[2] if decode_k is not None else 0
@@ -527,27 +724,80 @@ def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
         override_far_idx = mx.zeros((H_kv, MAX_OV), dtype=mx.int32)
         override_count = mx.zeros((H_kv,), dtype=mx.int32)
 
-    # S_total includes decode tokens for Split-K partitioning
     S_total_with_dec = N_fov + N_per + N_far + n_decode
     num_splits = (S_total_with_dec + split_size - 1) // split_size
+
+    all_inputs = [
+        mx.array([total_bh_q, n_decode], dtype=mx.uint32),
+    ] + inputs + [decode_k, decode_v,
+                  override_k, override_v, override_far_idx, override_count]
+
+    # Use merged kernel (single dispatch) when num_splits fits in one threadgroup
+    if num_splits * 32 <= 1024 and num_splits <= _MAX_SPLITS:
+        merged = _get_merged_kernel(
+            N_fov, N_per, N_far, D, H_q, H_kv,
+            spike_margin, split_size, num_splits,
+        )
+
+        # Pack inputs: 23 → 15 arrays (concat K+V pairs, interleave scale+zero)
+        # inputs = [q_flat, foveal_k, foveal_v, periph_k, periph_v,
+        #           periph_k_scale, periph_k_zero, pv_s, pv_z,
+        #           far_k, far_v, far_k_scale, far_k_zero, fv_s, fv_z,
+        #           foveal_valid]
+        q_flat = inputs[0]
+        foveal_kv = mx.concatenate([inputs[1], inputs[2]], axis=2)      # K+V on token dim
+        periph_kv = mx.concatenate([inputs[3], inputs[4]], axis=2)
+        periph_k_sz = mx.concatenate([inputs[5], inputs[6]], axis=0)    # scale, zero on batch dim
+        periph_v_sz = mx.concatenate([inputs[7], inputs[8]], axis=1)    # scale, zero on token dim
+        # far_k and far_v have different D (D vs D/2), can't pack
+        far_k_sz = mx.concatenate([inputs[11], inputs[12]], axis=0)
+        far_v_sz = mx.concatenate([inputs[13], inputs[14]], axis=1)
+        foveal_valid = inputs[15]
+        decode_kv = mx.concatenate([decode_k, decode_v], axis=2)
+        override_kv = mx.concatenate([override_k, override_v], axis=1)  # on MAX_OV dim
+
+        packed_inputs = [
+            mx.array([total_bh_q, n_decode], dtype=mx.uint32),  # 0: rt_params
+            q_flat,                                               # 1: query
+            foveal_kv,                                            # 2: foveal K+V
+            periph_kv,                                            # 3: periph K+V
+            periph_k_sz,                                          # 4: periph K scale+zero
+            periph_v_sz,                                          # 5: periph V scale+zero
+            inputs[9],                                            # 6: far_k
+            inputs[10],                                           # 7: far_v
+            far_k_sz,                                             # 8: far K scale+zero
+            far_v_sz,                                             # 9: far V scale+zero
+            foveal_valid,                                         # 10: foveal_valid
+            decode_kv,                                            # 11: decode K+V
+            override_kv,                                          # 12: override K+V
+            override_far_idx,                                     # 13: override_far_idx
+            override_count,                                       # 14: override_count
+        ]
+
+        outputs = merged(
+            inputs=packed_inputs,
+            output_shapes=[(total_bh_q, D), (total_bh_q,), (total_bh_q,)],
+            output_dtypes=[mx.float16, mx.int32, mx.int32],
+            grid=(total_bh_q * num_splits * 32, 1, 1),
+            threadgroup=(num_splits * 32, 1, 1),
+        )
+        return (
+            outputs[0].reshape(B, H_q, 1, D),
+            outputs[1].reshape(B, H_q),
+            outputs[2].reshape(B, H_q),
+        )
+
+    # Fallback: two-pass Split-K + Reduce for very long contexts
+    sk_kernel, red_kernel = _get_splitk_kernels(
+        N_fov, N_per, N_far, D, H_q, H_kv, spike_margin, split_size,
+    )
+
     partial_size = num_splits * total_bh_q
-
-    # Runtime params
-    sk_rt_params = mx.array([total_bh_q, n_decode], dtype=mx.uint32)
-    red_rt_params = mx.array([num_splits, total_bh_q], dtype=mx.uint32)
-
-    # Kernel 1: Split-K main — each threadgroup handles a token range
-    # (includes decode buffer as 4th tier in the split partitioning)
     partials = sk_kernel(
-        inputs=[sk_rt_params] + inputs + [decode_k, decode_v,
-                override_k, override_v, override_far_idx, override_count],
+        inputs=all_inputs,
         output_shapes=[
-            (partial_size, D),   # partial_out (float32)
-            (partial_size,),     # partial_lse
-            (partial_size,),     # partial_max
-            (partial_size,),     # partial_min_fov
-            (partial_size,),     # partial_max_far
-            (partial_size,),     # partial_far_token
+            (partial_size, D), (partial_size,), (partial_size,),
+            (partial_size,), (partial_size,), (partial_size,),
         ],
         output_dtypes=[
             mx.float32, mx.float32, mx.float32,
@@ -558,7 +808,7 @@ def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
         init_value=0.0,
     )
 
-    # Kernel 2: Reduce — merge Split-K partial results
+    red_rt_params = mx.array([num_splits, total_bh_q], dtype=mx.uint32)
     outputs = red_kernel(
         inputs=[red_rt_params] + list(partials),
         output_shapes=[(total_bh_q, D), (total_bh_q,), (total_bh_q,)],

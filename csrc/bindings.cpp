@@ -5,6 +5,7 @@
 
 #include "mlx/mlx.h"
 #include "foveated_attn.h"
+#include "foveated_primitive.h"
 
 namespace nb = nanobind;
 using namespace mlx::core;
@@ -64,6 +65,45 @@ NB_MODULE(foveated_ext, m) {
             nb::arg("override_k"), nb::arg("override_v"),
             nb::arg("override_far_idx"), nb::arg("override_count"),
             "Dispatch with dynamic inputs only (7 arrays).");
+
+    // Direct-dispatch handle: uses FoveatedPrimitive with CommandEncoder.
+    // Eliminates fast::metal_kernel overhead entirely.
+    nb::class_<foveated::FoveatedHandleDirect>(m, "FoveatedHandleDirect")
+        .def("__init__", [](foveated::FoveatedHandleDirect* self,
+            const array& foveal_k, const array& foveal_v,
+            const array& periph_k, const array& periph_v,
+            const array& periph_k_scale, const array& periph_k_zero,
+            const array& periph_v_scale, const array& periph_v_zero,
+            const array& far_k, const array& far_v,
+            const array& far_k_scale, const array& far_k_zero,
+            const array& far_v_scale, const array& far_v_zero,
+            const array& foveal_valid,
+            float spike_margin, int max_ov) {
+                new (self) foveated::FoveatedHandleDirect(
+                    foveal_k, foveal_v, periph_k, periph_v,
+                    periph_k_scale, periph_k_zero, periph_v_scale, periph_v_zero,
+                    far_k, far_v, far_k_scale, far_k_zero,
+                    far_v_scale, far_v_zero, foveal_valid,
+                    spike_margin, max_ov);
+            },
+            nb::arg("foveal_k"), nb::arg("foveal_v"),
+            nb::arg("periph_k"), nb::arg("periph_v"),
+            nb::arg("periph_k_scale"), nb::arg("periph_k_zero"),
+            nb::arg("periph_v_scale"), nb::arg("periph_v_zero"),
+            nb::arg("far_k"), nb::arg("far_v"),
+            nb::arg("far_k_scale"), nb::arg("far_k_zero"),
+            nb::arg("far_v_scale"), nb::arg("far_v_zero"),
+            nb::arg("foveal_valid"),
+            nb::arg("spike_margin") = 0.5f,
+            nb::arg("max_ov") = 32,
+            "Pre-bind static arrays for direct CommandEncoder dispatch.")
+        .def("__call__",
+            &foveated::FoveatedHandleDirect::operator(),
+            nb::arg("query"),
+            nb::arg("decode_k"), nb::arg("decode_v"),
+            nb::arg("override_k"), nb::arg("override_v"),
+            nb::arg("override_far_idx"), nb::arg("override_count"),
+            "Dispatch with 7 dynamic inputs via direct CommandEncoder.");
 
     m.def("is_available", []() -> bool {
         try {

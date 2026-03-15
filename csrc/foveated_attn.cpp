@@ -20,7 +20,8 @@ using namespace mlx::core;
 // Metal kernel source strings — transplanted from metal_foveated.py
 // ---------------------------------------------------------------------------
 
-static const char* TIER_PROCESSING = R"METAL(
+// Exported for use by FoveatedPrimitive's direct dispatch
+const char* TIER_PROCESSING = R"METAL(
     // ==== FOVEAL (fp16 K + fp16 V, with padding mask) ====
     uint fov_valid = foveal_valid[kv_head];
     uint fov_kv_base = bh_kv * N_FOV * HEAD_DIM;
@@ -153,7 +154,7 @@ static const char* TIER_PROCESSING = R"METAL(
     }
 )METAL";
 
-static const char* SPLITK_SETUP = R"METAL(
+const char* SPLITK_SETUP = R"METAL(
     uint TOTAL_BH_Q = rt_params[0];
     uint N_DECODE    = rt_params[1];
 
@@ -206,7 +207,7 @@ static const char* SPLITK_SETUP = R"METAL(
     uint dec_end   = (gend   > nfpf) ? min(gend   - nfpf, N_DECODE) : 0u;
 )METAL";
 
-static const char* SPLITK_WRITE = R"METAL(
+const char* SPLITK_WRITE = R"METAL(
     uint out_idx = split_id * TOTAL_BH_Q + bh_q;
     for (uint c = 0; c < CPT; c++)
         partial_out[out_idx * HEAD_DIM + lane_id * CPT + c] = acc[c];
@@ -219,7 +220,7 @@ static const char* SPLITK_WRITE = R"METAL(
     }
 )METAL";
 
-static const char* REDUCE_SOURCE = R"METAL(
+const char* REDUCE_SOURCE = R"METAL(
     uint NUM_SPLITS = rt_params[0];
     uint TOTAL_BH_Q = rt_params[1];
 

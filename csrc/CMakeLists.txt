@@ -22,6 +22,7 @@ nanobind_add_module(foveated_ext
     NB_DOMAIN mlx
     bindings.cpp
     foveated_attn.cpp
+    foveated_primitive.cpp
 )
 
 target_include_directories(foveated_ext PRIVATE

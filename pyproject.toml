@@ -18,6 +18,11 @@ dependencies = [
 dev = [
     "pytest",
 ]
+ext = [
+    "nanobind==2.10.2",
+    "cmake>=3.24",
+    "setuptools",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

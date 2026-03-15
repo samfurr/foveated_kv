@@ -26,7 +26,7 @@ from benchmarks.benchmark_longbench import (
     score_task,
 )
 from mipmap_kv.mlx_foveated import MLXTierConfig
-from mipmap_kv.mlx_generate import generate_foveated, _generate_short
+from mipmap_kv.mlx_generate import generate_fused, _generate_short
 
 # 6 tasks, one per LongBench category
 DEFAULT_TASKS = [
@@ -118,8 +118,9 @@ def run_task(model, tokenizer, task_name: str, samples: list,
             if method == "standard":
                 text, _ = _generate_short(model, tokenizer, prompt, max_tokens=max_gen)
             else:
-                text, _ = generate_foveated(
+                text, _ = generate_fused(
                     model, tokenizer, prompt, max_tokens=max_gen, cfg=cfg,
+                    enable_promotion=False,
                 )
         except Exception as e:
             text = ""

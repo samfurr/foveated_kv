@@ -155,12 +155,17 @@ class TestMLXFoveatedCache:
         cache, _, _ = self._make_cache(S=S, cfg=cfg)
         cache.compress()
         layer = cache.layers[0]
-        # Foveal: max(50, 36 reserved) = 50
-        assert layer.foveal_k.shape[2] == 50
+        # Foveal: 50 valid + headroom padding
+        assert int(mx.max(layer.foveal_valid).item()) == 50
+        assert layer.foveal_k.shape[2] > 50  # padded
         # Peripheral: 250
         assert layer.periph_k.shape[2] == 250
         # Far: 700
         assert layer.far_k.shape[2] == 700
+        # Padding slots are zeros
+        pad_start = int(layer.foveal_valid[0].item())
+        assert mx.all(layer.foveal_k[0, 0, pad_start:] == 0).item()
+        assert mx.all(layer.foveal_v[0, 0, pad_start:] == 0).item()
 
     def test_attend_output_shape(self):
         cache, _, _ = self._make_cache(S=256, H_kv=2, D=64)
@@ -225,9 +230,10 @@ class TestMLXFoveatedCache:
         mx.eval(new_k, new_v)
         layer.add_token(new_k, new_v)
 
-        # Foveal stays fixed; decode buffer holds new token
+        # Decode buffer holds new token; effective foveal = valid + 1 decode
         assert len(layer._decode_k_buf) == 1
-        assert layer.effective_foveal_k.shape[2] == layer.foveal_k.shape[2] + 1
+        valid = int(mx.max(layer.foveal_valid).item())
+        assert layer.effective_foveal_k.shape[2] == valid + 1
 
     def test_multi_layer(self):
         cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
@@ -314,13 +320,13 @@ class TestFusedMetalKernel:
         assert is_available(), "Metal fused kernel should be available on Apple Silicon"
 
     def test_fused_matches_reference(self):
-        """Fused Metal kernel should match dequant+SDPA reference."""
+        """Fused Metal kernel should match dequant+SDPA reference closely."""
         cache, _, _, query = self._make_cache(S=256, H_kv=2, D=64, H_q=8)
         ref_out = cache.attend(0, query)
         fused_out = cache.attend_fused(0, query)
         mx.eval(ref_out, fused_out)
         cos = _cosine(fused_out, ref_out)
-        assert cos > 0.999, f"Fused vs reference cosine {cos:.6f}"
+        assert cos > 0.99999, f"Fused vs reference cosine {cos:.6f}"
 
     def test_fused_d128(self):
         """Test with D=128 (Qwen2.5-7B head dim)."""
@@ -329,7 +335,7 @@ class TestFusedMetalKernel:
         fused_out = cache.attend_fused(0, query)
         mx.eval(ref_out, fused_out)
         cos = _cosine(fused_out, ref_out)
-        assert cos > 0.999, f"Fused D=128 cosine {cos:.6f}"
+        assert cos > 0.99999, f"Fused D=128 cosine {cos:.6f}"
 
     def test_fused_no_gqa(self):
         """H_q == H_kv (no GQA)."""
@@ -338,7 +344,7 @@ class TestFusedMetalKernel:
         fused_out = cache.attend_fused(0, query)
         mx.eval(ref_out, fused_out)
         cos = _cosine(fused_out, ref_out)
-        assert cos > 0.999, f"No-GQA fused cosine {cos:.6f}"
+        assert cos > 0.99999, f"No-GQA fused cosine {cos:.6f}"
 
     def test_fused_quality_vs_exact(self):
         """Fused should match exact fp16 as closely as reference does."""

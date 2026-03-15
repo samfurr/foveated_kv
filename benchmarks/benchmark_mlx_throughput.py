@@ -22,7 +22,7 @@ import mlx.core as mx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from mipmap_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
 from mipmap_kv.mlx_generate import (
-    generate_fused, generate_foveated, _generate_short, prefill_and_compress,
+    generate_fused, _generate_short, prefill_and_compress,
 )
 from mipmap_kv.disk_archive import offload_cache_to_disk
 
@@ -38,15 +38,6 @@ def measure_method(model, tokenizer, prompt, method, gen_tokens, cfg=None):
             "tok_per_s": gen_tokens / elapsed,
             "elapsed_s": round(elapsed, 2),
             "kv_memory_mb": "N/A (full fp16)",
-        }
-
-    elif method == "foveated_unfused":
-        _, stats = generate_foveated(model, tokenizer, prompt, max_tokens=gen_tokens, cfg=cfg)
-        elapsed = time.perf_counter() - t_start
-        return {
-            "tok_per_s": gen_tokens / elapsed,
-            "elapsed_s": round(elapsed, 2),
-            "kv_memory_mb": round(stats.get("tiers", {}).get("foveal", 0) * 0.001, 1),
         }
 
     elif method == "fused":

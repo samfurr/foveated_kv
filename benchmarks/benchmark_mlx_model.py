@@ -23,8 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from mipmap_kv.mlx_foveated import MLXTierConfig
 from mipmap_kv.mlx_generate import (
     compute_perplexity,
-    generate_foveated,
-    generate_with_promotion,
+    generate_fused,
     needle_test,
 )
 
@@ -118,12 +117,12 @@ def run_generation_benchmark(
     for prompt in prompts:
         print(f"\nPrompt: {prompt[:80]}...")
 
-        # Foveated
-        fov_text, fov_stats = generate_foveated(
+        # Foveated (fused path)
+        fov_text, fov_stats = generate_fused(
             model, tokenizer, prompt, max_tokens=max_tokens, cfg=cfg,
+            enable_promotion=False,
         )
         print(f"  Foveated: {fov_text[:120]}...")
-        print(f"  Tiers: {fov_stats.get('tiers', {})}")
 
         results.append({
             "prompt": prompt[:200],
@@ -167,10 +166,11 @@ def run_promotion_benchmark(
     tmpdir = tempfile.mkdtemp() if use_disk else None
 
     start = time.perf_counter()
-    output, stats = generate_with_promotion(
+    output, stats = generate_fused(
         model, tokenizer, prompt,
         max_tokens=gen_tokens, cfg=cfg,
         disk_archive_dir=tmpdir,
+        enable_promotion=True,
     )
     elapsed = time.perf_counter() - start
 
@@ -186,7 +186,7 @@ def run_promotion_benchmark(
     print(f"  Code retrieved:  {'Yes' if found_code else 'No'}")
 
     # Baseline speed: standard cache (no foveation)
-    from mipmap_kv.mlx_generate import _generate_short
+    from mipmap_kv.mlx_generate import _generate_short  # noqa: E402
     std_start = time.perf_counter()
     _generate_short(model, tokenizer, prompt, max_tokens=gen_tokens)
     std_elapsed = time.perf_counter() - std_start

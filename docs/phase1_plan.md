@@ -58,8 +58,7 @@ Rebuilt the entire system natively on MLX with custom Metal GPU kernels.
 6. **SDPA monkey-patch for mlx-lm** (`mlx_generate.py`): intercepts
    `mx.fast.scaled_dot_product_attention`, routes decode through fused kernel.
 
-7. **Cache wrappers** for mlx-lm integration: FoveatedCacheWrapper,
-   AsyncCacheWrapper, FusedCacheWrapper.
+7. **Cache wrapper** for mlx-lm integration: FusedCacheWrapper.
 
 8. **Full benchmark suite**: LongBench-Lite, needle heatmap, ablation, throughput.
 

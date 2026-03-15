@@ -23,6 +23,10 @@ from typing import Optional
 
 import mlx.core as mx
 
+# Capture the ORIGINAL sdpa before any monkey-patching happens.
+# Used by attend() to avoid recursion when the SDPA interceptor is installed.
+_original_sdpa = mx.fast.scaled_dot_product_attention
+
 from .mlx_quantize import (
     dequantize_int4_per_token,
     dequantize_int8_per_channel,
@@ -48,6 +52,8 @@ class MLXTierConfig:
     periph_pct: float = 0.18
     n_sinks: int = 4
     window_size: int = 32
+    promo_headroom_pct: float = 0.5  # extra foveal slots per head for promotion
+    promo_headroom_min: int = 8      # minimum padding slots
 
 
 @dataclass
@@ -87,20 +93,34 @@ class MLXFoveatedLayer:
     archive_v: mx.array = field(repr=False)
     archive_idx: mx.array = field(repr=False)
 
+    # Per-head valid count: tracks real (non-padding) foveal tokens per head.
+    # foveal_k has shape (B, H, N_fov_max, D) where N_fov_max includes padding.
+    # foveal_valid[h] = number of real tokens in head h (rest are zero padding).
+    foveal_valid: Optional[mx.array] = None  # (H_kv,) int32
+
     def __post_init__(self):
         max_pos = -1
         for idx_tensor in [self.foveal_idx, self.periph_idx, self.far_idx]:
             if idx_tensor.size > 0:
                 max_pos = max(max_pos, int(mx.max(idx_tensor).item()))
         self._next_pos = max_pos + 1
-        # Decode token buffer: O(1) append, single concat when kernel needs it.
-        # Avoids O(n²) chained concatenations from repeated add_token calls.
         self._decode_k_buf: list[mx.array] = []
         self._decode_v_buf: list[mx.array] = []
+        # Default foveal_valid: all slots valid (no padding)
+        if self.foveal_valid is None:
+            H = self.foveal_k.shape[1]
+            N = self.foveal_k.shape[2]
+            self.foveal_valid = mx.full((H,), N, dtype=mx.int32)
+        # Override buffer for promoted far-tier tokens (set by async promoter)
+        self.overrides = None
+        # Kernel cache (built lazily on first attend_fused call)
+        self._kcache = None
 
     @property
     def total_tokens(self) -> int:
-        return self.foveal_k.shape[2] + self.periph_k.shape[2] + self.far_k.shape[2]
+        # Use max valid count (not padded shape) for accurate token counting
+        n_fov = int(mx.max(self.foveal_valid).item()) if self.foveal_valid is not None else self.foveal_k.shape[2]
+        return n_fov + self.periph_k.shape[2] + self.far_k.shape[2]
 
     def attend(self, query: mx.array) -> mx.array:
         """Mixed-precision attention over all tiers.
@@ -131,9 +151,13 @@ class MLXFoveatedLayer:
             self.far_v, self.far_v_scale, self.far_v_zero
         )
 
-        # Concatenate all tiers (effective foveal includes decode buffer)
-        all_k = mx.concatenate([self.effective_foveal_k, periph_k_fp, far_k_fp], axis=2)
-        all_v = mx.concatenate([self.effective_foveal_v, periph_v_fp, far_v_fp], axis=2)
+        # Concatenate all tiers.
+        # effective_foveal strips padding (returns [valid + decode] only),
+        # so no attention mask needed — all positions are real tokens.
+        eff_k = self.effective_foveal_k
+        eff_v = self.effective_foveal_v
+        all_k = mx.concatenate([eff_k, periph_k_fp, far_k_fp], axis=2)
+        all_v = mx.concatenate([eff_v, periph_v_fp, far_v_fp], axis=2)
 
         # GQA: expand K,V to match query head count
         n_q_heads = query.shape[1]
@@ -141,62 +165,159 @@ class MLXFoveatedLayer:
         if n_q_heads != n_kv_heads:
             assert n_q_heads % n_kv_heads == 0
             group_size = n_q_heads // n_kv_heads
-            # Repeat along head dimension
             all_k = mx.repeat(all_k, group_size, axis=1)
             all_v = mx.repeat(all_v, group_size, axis=1)
 
         scale = 1.0 / math.sqrt(query.shape[-1])
-        return mx.fast.scaled_dot_product_attention(
-            query, all_k, all_v, scale=scale
+        return _original_sdpa(query, all_k, all_v, scale=scale)
+
+    def _ensure_kcache(self):
+        """Build kernel cache on first call. Caches static inputs + kernels."""
+        if self._kcache is not None:
+            return
+        from .metal_foveated import _get_splitk_kernels, DEFAULT_SPLIT_SIZE, MAX_OV
+
+        B = self.foveal_k.shape[0]
+        H_kv = self.foveal_k.shape[1]
+        H_q = H_kv  # updated on first real call
+        D = self.foveal_k.shape[-1]
+        N_fov = self.foveal_k.shape[2]
+        N_per = self.periph_k.shape[2]
+        N_far = self.far_k.shape[2]
+
+        # Pre-reshape the static arrays that _prepare_inputs would reshape each call
+        pv_s = self.periph_v_scale.reshape(B, H_kv, max(N_per, 0))
+        pv_z = self.periph_v_zero.reshape(B, H_kv, max(N_per, 0))
+        fv_s = self.far_v_scale.reshape(B, H_kv, max(N_far, 0))
+        fv_z = self.far_v_zero.reshape(B, H_kv, max(N_far, 0))
+        fov_valid_u32 = self.foveal_valid.astype(mx.uint32)
+
+        # Static input list (positions 1-15 in the kernel's input order)
+        # Position 0 = rt_params (dynamic), these start at "query" slot
+        static = [
+            self.foveal_k, self.foveal_v,
+            self.periph_k, self.periph_v,
+            self.periph_k_scale, self.periph_k_zero, pv_s, pv_z,
+            self.far_k, self.far_v,
+            self.far_k_scale, self.far_k_zero, fv_s, fv_z,
+            fov_valid_u32,
+        ]
+
+        # Pre-build zero override + empty decode arrays
+        zero_ov_k = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+        zero_ov_v = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+        zero_ov_idx = mx.zeros((H_kv, MAX_OV), dtype=mx.int32)
+        zero_ov_cnt = mx.zeros((H_kv,), dtype=mx.int32)
+        empty_dk = mx.zeros((B, H_kv, 0, D), dtype=mx.float16)
+        empty_dv = mx.zeros((B, H_kv, 0, D), dtype=mx.float16)
+
+        self._kcache = {
+            'B': B, 'H_kv': H_kv, 'D': D,
+            'N_fov': N_fov, 'N_per': N_per, 'N_far': N_far,
+            'split_size': DEFAULT_SPLIT_SIZE,
+            'static': static,
+            'zero_ov': (zero_ov_k, zero_ov_v, zero_ov_idx, zero_ov_cnt),
+            'empty_decode': (empty_dk, empty_dv),
+            'kernels': {},  # keyed by H_q (GQA ratio might vary)
+        }
+
+    def _dispatch_kernel(self, query: mx.array):
+        """Fast kernel dispatch using cached static inputs.
+
+        Skips foveated_attention_metal → _prepare_inputs → _run_splitk.
+        Returns (output, spike_flags, spike_tokens).
+        """
+        from .metal_foveated import _get_splitk_kernels
+
+        self._ensure_kcache()
+        c = self._kcache
+        B, H_kv, D = c['B'], c['H_kv'], c['D']
+        N_fov, N_per, N_far = c['N_fov'], c['N_per'], c['N_far']
+        split_size = c['split_size']
+        H_q = query.shape[1]
+        total_bh_q = B * H_q
+
+        # Get or cache kernels for this H_q
+        if H_q not in c['kernels']:
+            c['kernels'][H_q] = _get_splitk_kernels(
+                N_fov, N_per, N_far, D, H_q, H_kv, 0.5, split_size,
+            )
+        sk_kernel, red_kernel = c['kernels'][H_q]
+
+        # Dynamic: query
+        q_flat = query.reshape(total_bh_q, D)
+
+        # Dynamic: decode buffer
+        dk = self.decode_k
+        n_decode = dk.shape[2] if dk is not None else 0
+        if dk is None:
+            dk, dv = c['empty_decode']
+        else:
+            dv = self.decode_v
+
+        # Dynamic: overrides (only convert when active)
+        if self.overrides is not None:
+            ov = self.overrides
+            live = ov._live
+            if ov._count[live].any():
+                ov_k = mx.array(ov._k[live])
+                ov_v = mx.array(ov._v[live])
+                ov_idx = mx.array(ov._far_idx[live])
+                ov_cnt = mx.array(ov._count[live])
+            else:
+                ov_k, ov_v, ov_idx, ov_cnt = c['zero_ov']
+        else:
+            ov_k, ov_v, ov_idx, ov_cnt = c['zero_ov']
+
+        # Build input list: [rt_params, query, ...static..., decode, overrides]
+        S_total = N_fov + N_per + N_far + n_decode
+        num_splits = (S_total + split_size - 1) // split_size
+        partial_size = num_splits * total_bh_q
+
+        sk_rt = mx.array([total_bh_q, n_decode], dtype=mx.uint32)
+
+        partials = sk_kernel(
+            inputs=[sk_rt, q_flat] + c['static'] + [dk, dv, ov_k, ov_v, ov_idx, ov_cnt],
+            output_shapes=[
+                (partial_size, D), (partial_size,), (partial_size,),
+                (partial_size,), (partial_size,), (partial_size,),
+            ],
+            output_dtypes=[mx.float32, mx.float32, mx.float32,
+                           mx.float32, mx.float32, mx.int32],
+            grid=(num_splits * total_bh_q * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+            init_value=0.0,
+        )
+
+        red_rt = mx.array([num_splits, total_bh_q], dtype=mx.uint32)
+        outputs = red_kernel(
+            inputs=[red_rt] + list(partials),
+            output_shapes=[(total_bh_q, D), (total_bh_q,), (total_bh_q,)],
+            output_dtypes=[mx.float16, mx.int32, mx.int32],
+            grid=(total_bh_q * 32, 1, 1),
+            threadgroup=(32, 1, 1),
+        )
+
+        return (
+            outputs[0].reshape(B, H_q, 1, D),
+            outputs[1].reshape(B, H_q),
+            outputs[2].reshape(B, H_q),
         )
 
     def attend_fused(self, query: mx.array) -> mx.array:
-        """Fused Metal kernel: loads quantized data, dequants in registers.
-
-        Zero intermediate fp16 materialization — the key bandwidth optimization.
-        Falls back to eager dequant+SDPA if Metal kernel unavailable.
-
-        Args:
-            query: (B, H_q, 1, D) float16
-
-        Returns:
-            (B, H_q, 1, D) float16
-        """
+        """Fused Metal kernel — cached fast path."""
         if not _metal_available:
             return self.attend(query)
-
-        out, _, _ = foveated_attention_metal(
-            query,
-            self.foveal_k, self.foveal_v,
-            self.periph_k, self.periph_v,
-            self.periph_k_scale, self.periph_k_zero,
-            self.periph_v_scale, self.periph_v_zero,
-            self.far_k, self.far_v,
-            self.far_k_scale, self.far_k_zero,
-            self.far_v_scale, self.far_v_zero,
-            decode_k=self.decode_k, decode_v=self.decode_v,
-        )
+        out, _, _ = self._dispatch_kernel(query)
         return out
 
     def attend_fused_with_spikes(
         self, query: mx.array, spike_margin: float = 0.5
     ) -> tuple[mx.array, mx.array, mx.array]:
-        """Fused attention + spike detection in one kernel pass."""
+        """Fused attention + spike detection — cached fast path."""
         if not _metal_available:
             return self.attend(query), None, None
-
-        return foveated_attention_metal(
-            query,
-            self.foveal_k, self.foveal_v,
-            self.periph_k, self.periph_v,
-            self.periph_k_scale, self.periph_k_zero,
-            self.periph_v_scale, self.periph_v_zero,
-            self.far_k, self.far_v,
-            self.far_k_scale, self.far_k_zero,
-            self.far_v_scale, self.far_v_zero,
-            spike_margin=spike_margin,
-            decode_k=self.decode_k, decode_v=self.decode_v,
-        )
+        return self._dispatch_kernel(query)
 
     def add_token(self, new_k: mx.array, new_v: mx.array) -> None:
         """Add a newly generated token to the decode buffer.
@@ -228,14 +349,30 @@ class MLXFoveatedLayer:
 
     @property
     def effective_foveal_k(self) -> mx.array:
-        """Foveal + decode buffer (for unfused/reference attention path)."""
+        """Valid foveal + decode buffer, padding stripped.
+
+        Layout: [valid_foveal(R) | decode_tokens(N)] — no padding.
+        Used by the unfused SDPA path (model's own attention, no mask).
+        The fused kernel uses self.foveal_k directly (with padding).
+        """
+        # Strip padding: only valid foveal tokens
+        if self.foveal_valid is not None:
+            max_valid = int(mx.max(self.foveal_valid).item())
+            valid_k = self.foveal_k[:, :, :max_valid, :]
+        else:
+            valid_k = self.foveal_k
         dk = self.decode_k
-        return self.foveal_k if dk is None else mx.concatenate([self.foveal_k, dk], axis=2)
+        return valid_k if dk is None else mx.concatenate([valid_k, dk], axis=2)
 
     @property
     def effective_foveal_v(self) -> mx.array:
+        if self.foveal_valid is not None:
+            max_valid = int(mx.max(self.foveal_valid).item())
+            valid_v = self.foveal_v[:, :, :max_valid, :]
+        else:
+            valid_v = self.foveal_v
         dv = self.decode_v
-        return self.foveal_v if dv is None else mx.concatenate([self.foveal_v, dv], axis=2)
+        return valid_v if dv is None else mx.concatenate([valid_v, dv], axis=2)
 
     def detect_spikes(
         self, query: mx.array, margin: float = 0.5
@@ -382,10 +519,12 @@ class MLXFoveatedKVCache:
             )
 
     def compress(self, query: Optional[mx.array] = None) -> dict:
-        """Compress all layers: assign tiers, quantize, archive.
+        """Compress all layers: assign tiers by recency, quantize, archive.
 
-        Args:
-            query: (B, H_kv, D) scoring query. If None, uses mean of keys.
+        Pure positional assignment — sinks and recent window are foveal,
+        remaining tokens assigned by recency (most recent → peripheral,
+        oldest → far). No scoring needed. Promotion handles any important
+        tokens that end up in the far tier.
 
         Returns:
             dict with compression stats.
@@ -407,21 +546,7 @@ class MLXFoveatedKVCache:
             seq_length = S
             total_before += keys.size * keys.dtype.size * 2
 
-            if query is not None:
-                q = mx.squeeze(query, axis=2) if query.ndim == 4 else query
-            else:
-                q = mx.mean(keys, axis=2)
-
-            scores = (
-                mx.sum(
-                    mx.expand_dims(q.astype(mx.float32), axis=2)
-                    * keys.astype(mx.float32),
-                    axis=-1,
-                )
-                / math.sqrt(D)
-            )
-
-            layer = self._assign_and_build_layer(keys, values, scores, B, H, S, D)
+            layer = self._assign_and_build_layer(keys, values, B, H, S, D)
             self.layers[layer_idx] = layer
 
             mem = layer.memory_bytes()
@@ -444,13 +569,18 @@ class MLXFoveatedKVCache:
         self,
         keys: mx.array,
         values: mx.array,
-        scores: mx.array,
         B: int,
         H: int,
         S: int,
         D: int,
     ) -> MLXFoveatedLayer:
-        """Assign tiers and build an MLXFoveatedLayer."""
+        """Assign tiers by pure recency and build an MLXFoveatedLayer.
+
+        Layout: [sinks | far (oldest) | peripheral | foveal_mid | window]
+        Sinks and window are always foveal. Middle tokens are assigned by
+        recency: most recent → foveal overflow → peripheral → far.
+        Deterministic — no scoring, no argpartition non-determinism.
+        """
         cfg = self.cfg
         n_sinks = min(cfg.n_sinks, S)
         window = min(cfg.window_size, max(S - n_sinks, 0))
@@ -463,88 +593,39 @@ class MLXFoveatedKVCache:
             M_total = S - R_total
             F_total = 0
 
-        middle_start = n_sinks
-        middle_end = S - window if window > 0 else S
-        middle_len = max(middle_end - middle_start, 0)
+        # Middle region: between sinks and window
+        mid_start = n_sinks
+        mid_end = S - window if window > 0 else S
+        mid_len = max(mid_end - mid_start, 0)
 
-        foveal_from_middle = max(R_total - foveal_reserved, 0)
+        # Assign middle by recency (newest = closest to window)
+        fov_from_mid = min(max(R_total - foveal_reserved, 0), mid_len)
+        per_count = min(M_total, mid_len - fov_from_mid)
+        far_count = mid_len - fov_from_mid - per_count
 
-        if middle_len > 0:
-            middle_scores = scores[:, :, middle_start:middle_end]
+        # Build position indices — simple arange slices
+        def bcast(idx_1d):
+            n = idx_1d.size
+            if n == 0:
+                return mx.zeros((B, H, 0), dtype=mx.int32)
+            return mx.broadcast_to(idx_1d.reshape(1, 1, -1), (B, H, n)).astype(mx.int32)
 
-            total_from_middle = min(foveal_from_middle + M_total, middle_len)
-            if total_from_middle > 0:
-                # topk: MLX doesn't have topk directly, use argpartition + sort
-                top_mid_idx = mx.argpartition(
-                    -middle_scores, kth=total_from_middle - 1, axis=-1
-                )[:, :, :total_from_middle]
-                # Sort the selected indices by score (descending)
-                selected_scores = mx.take_along_axis(
-                    middle_scores, top_mid_idx, axis=-1
-                )
-                sort_order = mx.argsort(-selected_scores, axis=-1)
-                top_mid_idx = mx.take_along_axis(top_mid_idx, sort_order, axis=-1)
-                top_mid_idx = top_mid_idx + middle_start
-
-                k_fov = min(foveal_from_middle, total_from_middle)
-                fov_mid_idx = top_mid_idx[:, :, :k_fov]
-                per_mid_idx = top_mid_idx[:, :, k_fov:]
-            else:
-                fov_mid_idx = mx.zeros((B, H, 0), dtype=mx.int32)
-                per_mid_idx = mx.zeros((B, H, 0), dtype=mx.int32)
-        else:
-            fov_mid_idx = mx.zeros((B, H, 0), dtype=mx.int32)
-            per_mid_idx = mx.zeros((B, H, 0), dtype=mx.int32)
-
-        # Assemble foveal indices
+        # Foveal: [sinks] + [most recent middle] + [window]
         parts_fov = []
         if n_sinks > 0:
-            sink_idx = mx.broadcast_to(
-                mx.arange(n_sinks).reshape(1, 1, n_sinks), (B, H, n_sinks)
-            )
-            parts_fov.append(sink_idx)
-        if fov_mid_idx.shape[-1] > 0:
-            parts_fov.append(fov_mid_idx)
+            parts_fov.append(mx.arange(n_sinks))
+        if fov_from_mid > 0:
+            parts_fov.append(mx.arange(mid_end - fov_from_mid, mid_end))
         if window > 0:
-            win_idx = mx.broadcast_to(
-                mx.arange(S - window, S).reshape(1, 1, window), (B, H, window)
-            )
-            parts_fov.append(win_idx)
+            parts_fov.append(mx.arange(S - window, S))
+        foveal_idx = bcast(mx.concatenate(parts_fov) if parts_fov else mx.zeros((0,), dtype=mx.int32))
 
-        if parts_fov:
-            foveal_idx = mx.concatenate(parts_fov, axis=-1).astype(mx.int32)
-        else:
-            foveal_idx = mx.zeros((B, H, 0), dtype=mx.int32)
+        # Peripheral: next most recent middle
+        per_boundary = mid_end - fov_from_mid
+        periph_idx = bcast(mx.arange(per_boundary - per_count, per_boundary)) if per_count > 0 else mx.zeros((B, H, 0), dtype=mx.int32)
 
-        periph_idx = per_mid_idx.astype(mx.int32)
-
-        # Far indices: everything not assigned
-        all_assigned = mx.concatenate([foveal_idx, periph_idx], axis=-1)
-        all_indices = mx.broadcast_to(mx.arange(S).reshape(1, 1, S), (B, H, S))
-
-        # Build assigned mask
-        assigned_mask = mx.zeros((B, H, S), dtype=mx.bool_)
-        # Scatter True at assigned positions
-        mx.eval(all_assigned)
-        assigned_flat = all_assigned.reshape(B * H, -1)
-        mask_flat = mx.zeros((B * H, S), dtype=mx.bool_)
-
-        # Use a loop-free approach: create index tensors
-        for i in range(all_assigned.shape[-1]):
-            col_idx = all_assigned[:, :, i : i + 1]  # (B, H, 1)
-            one_hot = mx.zeros((B, H, S), dtype=mx.bool_)
-            # Scatter via equality
-            assigned_mask = assigned_mask | (all_indices == col_idx)
-
-        far_mask = ~assigned_mask
-        mx.eval(far_mask)
-
-        # Gather indices for far tier
-        # Count far tokens per (B, H)
-        n_far = F_total
-        # We know exact count: S - R_total - M_total
-        # Extract far indices using the mask
-        far_idx = _gather_indices_from_mask(all_indices, far_mask, B, H, n_far)
+        # Far: oldest middle tokens
+        far_idx = bcast(mx.arange(mid_start, mid_start + far_count)) if far_count > 0 else mx.zeros((B, H, 0), dtype=mx.int32)
 
         # Gather K, V
         def gather_kv(idx, n):
@@ -588,15 +669,31 @@ class MLXFoveatedKVCache:
             far_k_s = far_k_z = mx.zeros((B, H, D), dtype=mx.float16)
             far_v_s = far_v_z = mx.zeros((B, H, 0, 1), dtype=mx.float16)
 
+        # Pad foveal with zero slots for per-head promotion headroom
+        R_actual = fov_k.shape[2]
+        headroom = max(int(R_actual * cfg.promo_headroom_pct), cfg.promo_headroom_min)
+        N_fov_max = R_actual + headroom
+
+        # Zero-padded slots. For the Metal kernel: exp(0) = 1 per slot in softmax,
+        # but with only ~headroom padding vs ~S total tokens, the bias is <1%.
+        # For the Python SDPA path: an attention mask blocks padding positions.
+        pad_k = mx.zeros((B, H, headroom, D), dtype=fov_k.dtype)
+        pad_v = mx.zeros((B, H, headroom, D), dtype=fov_v.dtype)
+        pad_idx = mx.full((B, H, headroom), -1, dtype=mx.int32)
+        fov_k = mx.concatenate([fov_k, pad_k], axis=2)
+        fov_v = mx.concatenate([fov_v, pad_v], axis=2)
+        foveal_idx = mx.concatenate([foveal_idx, pad_idx], axis=-1)
+        foveal_valid = mx.full((H,), R_actual, dtype=mx.int32)
+
         # Force evaluation before building layer
         mx.eval(
-            fov_k, fov_v, foveal_idx,
+            fov_k, fov_v, foveal_idx, foveal_valid,
             per_k_q, per_v_q, per_k_s, per_k_z, per_v_s, per_v_z, periph_idx,
             far_k_q, far_v_q, far_k_s, far_k_z, far_v_s, far_v_z, far_idx,
             arc_k, arc_v, non_foveal_idx,
         )
 
-        return MLXFoveatedLayer(
+        layer = MLXFoveatedLayer(
             foveal_k=fov_k,
             foveal_v=fov_v,
             foveal_idx=foveal_idx,
@@ -617,7 +714,9 @@ class MLXFoveatedKVCache:
             archive_k=arc_k,
             archive_v=arc_v,
             archive_idx=non_foveal_idx,
+            foveal_valid=foveal_valid,
         )
+        return layer
 
     def attend(self, layer_idx: int, query: mx.array) -> mx.array:
         layer = self.layers[layer_idx]

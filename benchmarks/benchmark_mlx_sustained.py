@@ -30,8 +30,10 @@ import mlx.core as mx
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from mipmap_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
 from mipmap_kv.mlx_generate import (
-    FoveatedCacheWrapper,
-    AsyncCacheWrapper,
+    FusedCacheWrapper,
+    install_fused_sdpa,
+    uninstall_fused_sdpa,
+    reset_fused_layer_counter,
     prefill_and_compress,
     _generate_short,
 )
@@ -91,13 +93,13 @@ def build_topic_shift_prompt(tokenizer, context_len: int) -> str:
 
 def generate_with_logit_trace(
     model, tokenizer, prompt: str, max_tokens: int,
-    cache_wrappers=None, prefill_logits=None,
+    cache_wrappers=None, prefill_logits=None, fused: bool = False,
 ) -> tuple[list[int], list[mx.array]]:
     """Generate tokens and collect per-step logits for comparison.
 
     For foveated paths: pass cache_wrappers (already prefilled via
-    prefill_and_compress) and prefill_logits. Decode-only — no prefill
-    through the wrappers.
+    prefill_and_compress) and prefill_logits. Decode-only -- no prefill
+    through the wrappers. Set fused=True when using FusedCacheWrapper.
 
     For standard: cache_wrappers=None does a normal prefill + decode.
     """
@@ -129,6 +131,9 @@ def generate_with_logit_trace(
         if token_id == tokenizer.eos_token_id:
             break
         generated.append(token_id)
+
+        if fused:
+            reset_fused_layer_counter()
 
         next_input = next_token.reshape(1, 1)
         next_logits = model(next_input, cache=cache)
@@ -215,17 +220,20 @@ def main():
     tokens_mx = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
     fov_cache_frozen, frozen_prefill_logits, _ = prefill_and_compress(model, tokens_mx, cfg)
     frozen_wrappers = [
-        FoveatedCacheWrapper(layer) if layer is not None else None
-        for layer in fov_cache_frozen.layers
+        FusedCacheWrapper(layer, i) if layer is not None else None
+        for i, layer in enumerate(fov_cache_frozen.layers)
     ]
+    install_fused_sdpa(fov_cache_frozen)
 
     t0 = time.perf_counter()
     frozen_tokens, frozen_trace = generate_with_logit_trace(
         model, tokenizer, prompt, args.gen_tokens,
         cache_wrappers=frozen_wrappers,
         prefill_logits=frozen_prefill_logits,
+        fused=True,
     )
     frozen_time = time.perf_counter() - t0
+    uninstall_fused_sdpa()
     frozen_text = tokenizer.decode(frozen_tokens)
     frozen_found = passkey in frozen_text
     print(f"  {len(frozen_tokens)} tokens in {frozen_time:.1f}s | passkey: {'YES' if frozen_found else 'NO'}")
@@ -240,24 +248,34 @@ def main():
     disk_archives = offload_cache_to_disk(fov_cache_promo, tmpdir)
     promoter = AsyncPromoter(fov_cache_promo, disk_archives)
 
+    # Wire override buffers to layers so the Metal kernel can read them
+    for i, layer in enumerate(fov_cache_promo.layers):
+        if layer is not None:
+            layer.overrides = promoter.overrides_for_layer(i)
+
     promo_wrappers = [
-        AsyncCacheWrapper(layer, i, promoter) if layer is not None else None
+        FusedCacheWrapper(layer, i) if layer is not None else None
         for i, layer in enumerate(fov_cache_promo.layers)
     ]
+    install_fused_sdpa(fov_cache_promo, promoter=promoter)
+    from mipmap_kv.mlx_generate import _fused_state
+    _fused_state._fused_wrappers = promo_wrappers
 
     t0 = time.perf_counter()
     promo_tokens, promo_trace = generate_with_logit_trace(
         model, tokenizer, prompt, args.gen_tokens,
         cache_wrappers=promo_wrappers,
         prefill_logits=promo_prefill_logits,
+        fused=True,
     )
     promo_time = time.perf_counter() - t0
+    uninstall_fused_sdpa()
     promo_text = tokenizer.decode(promo_tokens)
     promo_found = passkey in promo_text
     promo_stats = promoter.get_stats()
     promoter.stop()
     print(f"  {len(promo_tokens)} tokens in {promo_time:.1f}s | passkey: {'YES' if promo_found else 'NO'}")
-    print(f"  Spikes: {promo_stats['spikes_detected']}, Promoted: {promo_stats['promotions_applied']}")
+    print(f"  Spikes: {promo_stats['spikes_detected']}, Overrides written: {promo_stats['promotions_completed']}")
     print(f"  Output: {promo_text[:100]}...")
 
     # Cleanup

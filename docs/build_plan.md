@@ -18,7 +18,7 @@ src/mipmap_kv/
                             numpy-only workers (no MLX in threads)
   mlx_generate.py        -- SDPA monkey-patch for mlx-lm
                             Intercepts mx.fast.scaled_dot_product_attention
-                            FoveatedCacheWrapper, AsyncCacheWrapper, FusedCacheWrapper
+                            FusedCacheWrapper, generate_fused, prefill_and_compress
   disk_archive.py        -- NVMe-backed numpy.memmap fp16 archive
                             One file per layer, ~50us/token read
 ```

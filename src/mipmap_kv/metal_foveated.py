@@ -23,6 +23,10 @@ _splitk_cache: dict[tuple, tuple] = {}
 # Default split size — tokens per split. Tuned for Apple Silicon occupancy.
 DEFAULT_SPLIT_SIZE = 256
 
+# Max overrides per KV head. Background worker writes promoted fp16 K,V here;
+# the Metal kernel reads from this buffer instead of dequanting INT8/INT4.
+MAX_OV = 32
+
 
 # ============================================================================
 # Shared Metal code fragments
@@ -31,9 +35,11 @@ DEFAULT_SPLIT_SIZE = 256
 # Score + softmax + accumulate logic used by the split-K kernel.
 # Parameterized by tier loop bounds set in each kernel variant.
 _TIER_PROCESSING = """
-    // ==== FOVEAL (fp16 K + fp16 V) ====
+    // ==== FOVEAL (fp16 K + fp16 V, with padding mask) ====
+    uint fov_valid = foveal_valid[kv_head];  // per-head valid count
     uint fov_kv_base = bh_kv * N_FOV * HEAD_DIM;
     for (uint t = fov_start; t < fov_end; t++) {
+        if (t >= fov_valid) continue;  // skip zero-padded slots
         float dot = 0.0f;
         for (uint c = 0; c < CPT; c++)
             dot += q_reg[c] * (float)foveal_k[fov_kv_base + t * HEAD_DIM + lane_id * CPT + c];
@@ -52,13 +58,16 @@ _TIER_PROCESSING = """
     }
 
     // ==== PERIPHERAL (INT8 K + INT8 V) ====
+    // Dequant rounds to fp16 via to_fp16(...) to match the reference path
+    // which dequants to fp16 before feeding to Apple's SDPA. Without this,
+    // float32 dequant introduces ~1 ULP differences that compound over 24 layers.
     uint per_kv_base = bh_kv * N_PER * HEAD_DIM;
     uint per_vs_base = bh_kv * N_PER;
     for (uint t = per_start; t < per_end; t++) {
         float dot = 0.0f;
         for (uint c = 0; c < CPT; c++) {
-            float k_val = (float)periph_k[per_kv_base + t * HEAD_DIM + lane_id * CPT + c]
-                          * pk_s[c] + pk_z[c];
+            float k_val = to_fp16((float)periph_k[per_kv_base + t * HEAD_DIM + lane_id * CPT + c]
+                          * pk_s[c] + pk_z[c]);
             dot += q_reg[c] * k_val;
         }
         float score = simd_sum(dot) * INV_SQRT_D;
@@ -73,22 +82,41 @@ _TIER_PROCESSING = """
         float vs = (float)periph_v_scale[per_vs_base + t];
         float vz = (float)periph_v_zero[per_vs_base + t];
         for (uint c = 0; c < CPT; c++) {
-            float v_val = (float)periph_v[per_kv_base + t * HEAD_DIM + lane_id * CPT + c]
-                          * vs + vz;
+            float v_val = to_fp16((float)periph_v[per_kv_base + t * HEAD_DIM + lane_id * CPT + c]
+                          * vs + vz);
             acc[c] += w * v_val;
         }
     }
 
-    // ==== FAR (INT8 K + INT4 V packed) ====
+    // ==== FAR (INT8 K + INT4 V packed, with promotion override buffer) ====
     uint far_k_base  = bh_kv * N_FAR * HEAD_DIM;
     uint far_v_base  = bh_kv * N_FAR * HEAD_DIM_HALF;
     uint far_vs_base = bh_kv * N_FAR;
+    uint n_ov = min((uint)override_count[kv_head], MAX_OV);
+
+    // Override buffer is pre-sorted by far index (CPU worker does sorted insert
+    // into a double buffer, then atomic swap). Merge-scan: O(N_FAR + n_ov).
+    uint ov_ptr = 0;
+    while (ov_ptr < n_ov && (uint)override_far_idx[kv_head * MAX_OV + ov_ptr] < far_start) ov_ptr++;
+
     for (uint t = far_start; t < far_end; t++) {
+        // Merge-scan: O(1) amortized — both sequences are monotonically increasing
+        bool overridden = (ov_ptr < n_ov && (uint)override_far_idx[kv_head * MAX_OV + ov_ptr] == t);
+        uint oi = ov_ptr;  // buffer is sorted in-place, slot == position
+        if (overridden) ov_ptr++;
+
         float dot = 0.0f;
-        for (uint c = 0; c < CPT; c++) {
-            float k_val = (float)far_k[far_k_base + t * HEAD_DIM + lane_id * CPT + c]
-                          * fk_s[c] + fk_z[c];
-            dot += q_reg[c] * k_val;
+        if (overridden) {
+            // Exact fp16 K from override buffer
+            uint ok_base = kv_head * MAX_OV * HEAD_DIM + oi * HEAD_DIM;
+            for (uint c = 0; c < CPT; c++)
+                dot += q_reg[c] * (float)override_k[ok_base + lane_id * CPT + c];
+        } else {
+            for (uint c = 0; c < CPT; c++) {
+                float k_val = to_fp16((float)far_k[far_k_base + t * HEAD_DIM + lane_id * CPT + c]
+                              * fk_s[c] + fk_z[c]);
+                dot += q_reg[c] * k_val;
+            }
         }
         float score = simd_sum(dot) * INV_SQRT_D;
 
@@ -104,16 +132,23 @@ _TIER_PROCESSING = """
         m = m_new;
 
         float w  = exp(score - m);
-        float vs = (float)far_v_scale[far_vs_base + t];
-        float vz = (float)far_v_zero[far_vs_base + t];
-        for (uint c = 0; c < CPT; c += 2) {
-            uint d_even   = lane_id * CPT + c;
-            uint packed_d = d_even / 2;
-            uint8_t packed_byte = far_v[far_v_base + t * HEAD_DIM_HALF + packed_d];
-            float v_even = (float)(packed_byte & 0x0F)        * vs + vz;
-            float v_odd  = (float)((packed_byte >> 4) & 0x0F) * vs + vz;
-            acc[c]     += w * v_even;
-            acc[c + 1] += w * v_odd;
+        if (overridden) {
+            // Exact fp16 V from override buffer
+            uint ov_base = kv_head * MAX_OV * HEAD_DIM + oi * HEAD_DIM;
+            for (uint c = 0; c < CPT; c++)
+                acc[c] += w * (float)override_v[ov_base + lane_id * CPT + c];
+        } else {
+            float vs = (float)far_v_scale[far_vs_base + t];
+            float vz = (float)far_v_zero[far_vs_base + t];
+            for (uint c = 0; c < CPT; c += 2) {
+                uint d_even   = lane_id * CPT + c;
+                uint packed_d = d_even / 2;
+                uint8_t packed_byte = far_v[far_v_base + t * HEAD_DIM_HALF + packed_d];
+                float v_even = to_fp16((float)(packed_byte & 0x0F)        * vs + vz);
+                float v_odd  = to_fp16((float)((packed_byte >> 4) & 0x0F) * vs + vz);
+                acc[c]     += w * v_even;
+                acc[c + 1] += w * v_odd;
+            }
         }
     }
 
@@ -295,6 +330,10 @@ def _make_header(n_fov, n_per, n_far, head_dim, h_q, h_kv, spike_margin, **extra
     constant uint CPT = {cpt};
     constant float INV_SQRT_D = {1.0 / math.sqrt(head_dim):.10f}f;
     constant float SPIKE_MARGIN = {spike_margin:.6f}f;
+    constant uint MAX_OV = {MAX_OV};
+
+    // Round float32 to fp16 precision (matches reference dequant path)
+    inline float to_fp16(float x) {{ return (float)((half)x); }}
     """
     for k, v in extra.items():
         lines += f"    constant uint {k} = {v};\n"
@@ -321,7 +360,10 @@ def _build_splitk_kernels(n_fov, n_per, n_far, head_dim, h_q, h_kv,
             "periph_v_scale", "periph_v_zero",
             "far_k", "far_v", "far_k_scale", "far_k_zero",
             "far_v_scale", "far_v_zero",
+            "foveal_valid",          # (H_kv,) uint32 — per-head valid count
             "decode_k", "decode_v",  # (B, H_kv, N_decode, D) fp16
+            "override_k", "override_v",        # (H_kv, MAX_OV, D) fp16
+            "override_far_idx", "override_count",  # (H_kv, MAX_OV) int32, (H_kv,) int32
         ],
         output_names=[
             "partial_out", "partial_lse", "partial_max",
@@ -367,7 +409,8 @@ def _prepare_inputs(query, foveal_k, foveal_v,
                     periph_k, periph_v, periph_k_scale, periph_k_zero,
                     periph_v_scale, periph_v_zero,
                     far_k, far_v, far_k_scale, far_k_zero,
-                    far_v_scale, far_v_zero):
+                    far_v_scale, far_v_zero,
+                    foveal_valid=None):
     """Flatten/squeeze inputs for kernel consumption."""
     B, H_q, _, D = query.shape
     H_kv = foveal_k.shape[1]
@@ -381,10 +424,17 @@ def _prepare_inputs(query, foveal_k, foveal_v,
     fv_s = far_v_scale.reshape(B, H_kv, max(N_far, 0))
     fv_z = far_v_zero.reshape(B, H_kv, max(N_far, 0))
 
+    # Default foveal_valid: all slots valid (no padding)
+    if foveal_valid is None:
+        foveal_valid = mx.full((H_kv,), N_fov, dtype=mx.uint32)
+    else:
+        foveal_valid = foveal_valid.astype(mx.uint32)
+
     return (
         [q_flat, foveal_k, foveal_v,
          periph_k, periph_v, periph_k_scale, periph_k_zero, pv_s, pv_z,
-         far_k, far_v, far_k_scale, far_k_zero, fv_s, fv_z],
+         far_k, far_v, far_k_scale, far_k_zero, fv_s, fv_z,
+         foveal_valid],
         B, H_q, H_kv, D, N_fov, N_per, N_far,
     )
 
@@ -399,6 +449,11 @@ def foveated_attention_metal(
     split_size: int = DEFAULT_SPLIT_SIZE,
     decode_k: mx.array = None,
     decode_v: mx.array = None,
+    foveal_valid: mx.array = None,
+    override_k: mx.array = None,
+    override_v: mx.array = None,
+    override_far_idx: mx.array = None,
+    override_count: mx.array = None,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Fused foveated attention via custom Split-K Metal kernel.
 
@@ -416,18 +471,24 @@ def foveated_attention_metal(
         periph_v_scale, periph_v_zero,
         far_k, far_v, far_k_scale, far_k_zero,
         far_v_scale, far_v_zero,
+        foveal_valid=foveal_valid,
     )
 
     total_bh_q = B * H_q
 
     return _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
                        spike_margin, total_bh_q, split_size,
-                       decode_k=decode_k, decode_v=decode_v)
+                       decode_k=decode_k, decode_v=decode_v,
+                       override_k=override_k, override_v=override_v,
+                       override_far_idx=override_far_idx,
+                       override_count=override_count)
 
 
 def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
                 spike_margin, total_bh_q, split_size,
-                decode_k=None, decode_v=None):
+                decode_k=None, decode_v=None,
+                override_k=None, override_v=None,
+                override_far_idx=None, override_count=None):
     sk_kernel, red_kernel = _get_splitk_kernels(
         N_fov, N_per, N_far, D, H_q, H_kv, spike_margin, split_size,
     )
@@ -437,6 +498,13 @@ def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
     if decode_k is None:
         decode_k = mx.zeros((B, H_kv, 0, D), dtype=mx.float16)
         decode_v = mx.zeros((B, H_kv, 0, D), dtype=mx.float16)
+
+    # Override buffer — promoted fp16 K,V for far-tier tokens
+    if override_k is None:
+        override_k = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+        override_v = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+        override_far_idx = mx.zeros((H_kv, MAX_OV), dtype=mx.int32)
+        override_count = mx.zeros((H_kv,), dtype=mx.int32)
 
     # S_total includes decode tokens for Split-K partitioning
     S_total_with_dec = N_fov + N_per + N_far + n_decode
@@ -450,7 +518,8 @@ def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
     # Kernel 1: Split-K main — each threadgroup handles a token range
     # (includes decode buffer as 4th tier in the split partitioning)
     partials = sk_kernel(
-        inputs=[sk_rt_params] + inputs + [decode_k, decode_v],
+        inputs=[sk_rt_params] + inputs + [decode_k, decode_v,
+                override_k, override_v, override_far_idx, override_count],
         output_shapes=[
             (partial_size, D),   # partial_out (float32)
             (partial_size,),     # partial_lse

@@ -43,6 +43,17 @@ try:
 except Exception:
     _metal_available = False
 
+# Optional C++ extension (eliminates Python dispatch overhead)
+try:
+    import sys as _sys
+    if 'src' not in _sys.path:
+        import os as _os
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), '..', '..'))
+    from foveated_ext import FoveatedHandle as _FoveatedHandle
+    _cpp_ext_available = True
+except ImportError:
+    _cpp_ext_available = False
+
 
 @dataclass
 class MLXTierConfig:
@@ -172,9 +183,32 @@ class MLXFoveatedLayer:
         return _original_sdpa(query, all_k, all_v, scale=scale)
 
     def _ensure_kcache(self):
-        """Build kernel cache on first call. Caches static inputs + kernels."""
+        """Build kernel cache on first call. C++ handle if available, else Python."""
         if self._kcache is not None:
             return
+
+        # Try C++ fast path first
+        if _cpp_ext_available:
+            from .metal_foveated import MAX_OV
+            self._kcache = {
+                'cpp_handle': _FoveatedHandle(
+                    self.foveal_k, self.foveal_v,
+                    self.periph_k, self.periph_v,
+                    self.periph_k_scale, self.periph_k_zero,
+                    self.periph_v_scale, self.periph_v_zero,
+                    self.far_k, self.far_v,
+                    self.far_k_scale, self.far_k_zero,
+                    self.far_v_scale, self.far_v_zero,
+                    self.foveal_valid,
+                    spike_margin=0.5,
+                    max_ov=MAX_OV,
+                ),
+                'B': self.foveal_k.shape[0],
+                'H_kv': self.foveal_k.shape[1],
+                'D': self.foveal_k.shape[-1],
+            }
+            return
+
         from .metal_foveated import _get_splitk_kernels, optimal_split_size, MAX_OV
 
         B = self.foveal_k.shape[0]
@@ -222,26 +256,60 @@ class MLXFoveatedLayer:
         }
 
     def _dispatch_kernel(self, query: mx.array):
-        """Fast kernel dispatch using cached static inputs.
+        """Dispatch fused kernel. C++ handle if available, else Python fallback.
 
-        Skips foveated_attention_metal → _prepare_inputs → _run_splitk.
         Returns (output, spike_flags, spike_tokens).
         """
-        from .metal_foveated import _get_splitk_kernels, optimal_split_size
-
         self._ensure_kcache()
         c = self._kcache
+
+        # --- C++ fast path: one nanobind call, 7 dynamic inputs ---
+        if 'cpp_handle' in c:
+            dk = self.decode_k
+            if dk is None:
+                B, H_kv, D = c['B'], c['H_kv'], c['D']
+                dk = mx.zeros((B, H_kv, 0, D), dtype=mx.float16)
+                dv = dk
+            else:
+                dv = self.decode_v
+
+            if self.overrides is not None:
+                ov = self.overrides
+                live = ov._live
+                if ov._count[live].any():
+                    ov_k = mx.array(ov._k[live])
+                    ov_v = mx.array(ov._v[live])
+                    ov_idx = mx.array(ov._far_idx[live])
+                    ov_cnt = mx.array(ov._count[live])
+                else:
+                    H_kv, D = c['H_kv'], c['D']
+                    from .metal_foveated import MAX_OV
+                    ov_k = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+                    ov_v = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+                    ov_idx = mx.zeros((H_kv, MAX_OV), dtype=mx.int32)
+                    ov_cnt = mx.zeros((H_kv,), dtype=mx.int32)
+            else:
+                H_kv, D = c['H_kv'], c['D']
+                from .metal_foveated import MAX_OV
+                ov_k = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+                ov_v = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
+                ov_idx = mx.zeros((H_kv, MAX_OV), dtype=mx.int32)
+                ov_cnt = mx.zeros((H_kv,), dtype=mx.int32)
+
+            return c['cpp_handle'](query, dk, dv, ov_k, ov_v, ov_idx, ov_cnt)
+
+        # --- Python fallback ---
+        from .metal_foveated import _get_splitk_kernels, optimal_split_size
+
         B, H_kv, D = c['B'], c['H_kv'], c['D']
         N_fov, N_per, N_far = c['N_fov'], c['N_per'], c['N_far']
         H_q = query.shape[1]
         total_bh_q = B * H_q
 
-        # Adaptive split size based on total tokens (including decode buffer)
-        dk_temp = self.decode_k
-        n_dec = dk_temp.shape[2] if dk_temp is not None else 0
+        dk = self.decode_k
+        n_dec = dk.shape[2] if dk is not None else 0
         split_size = optimal_split_size(c['N_static'] + n_dec)
 
-        # Get or cache kernels for this (H_q, split_size) combo
         kernel_key = (H_q, split_size)
         if kernel_key not in c['kernels']:
             c['kernels'][kernel_key] = _get_splitk_kernels(
@@ -249,18 +317,13 @@ class MLXFoveatedLayer:
             )
         sk_kernel, red_kernel = c['kernels'][kernel_key]
 
-        # Dynamic: query
         q_flat = query.reshape(total_bh_q, D)
-
-        # Dynamic: decode buffer
-        dk = self.decode_k
-        n_decode = dk.shape[2] if dk is not None else 0
         if dk is None:
             dk, dv = c['empty_decode']
         else:
             dv = self.decode_v
+        n_decode = dk.shape[2] if dk is not None else 0
 
-        # Dynamic: overrides (only convert when active)
         if self.overrides is not None:
             ov = self.overrides
             live = ov._live
@@ -274,13 +337,11 @@ class MLXFoveatedLayer:
         else:
             ov_k, ov_v, ov_idx, ov_cnt = c['zero_ov']
 
-        # Build input list: [rt_params, query, ...static..., decode, overrides]
         S_total = N_fov + N_per + N_far + n_decode
         num_splits = (S_total + split_size - 1) // split_size
         partial_size = num_splits * total_bh_q
 
         sk_rt = mx.array([total_bh_q, n_decode], dtype=mx.uint32)
-
         partials = sk_kernel(
             inputs=[sk_rt, q_flat] + c['static'] + [dk, dv, ov_k, ov_v, ov_idx, ov_cnt],
             output_shapes=[

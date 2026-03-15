@@ -39,6 +39,32 @@ NB_MODULE(foveated_ext, m) {
         return a.size();
     });
 
+    nb::class_<foveated::FoveatedHandle>(m, "FoveatedHandle")
+        .def(nb::init<
+            const array&, const array&, const array&, const array&,
+            const array&, const array&, const array&, const array&,
+            const array&, const array&, const array&, const array&,
+            const array&, const array&, const array&,
+            float, int>(),
+            nb::arg("foveal_k"), nb::arg("foveal_v"),
+            nb::arg("periph_k"), nb::arg("periph_v"),
+            nb::arg("periph_k_scale"), nb::arg("periph_k_zero"),
+            nb::arg("periph_v_scale"), nb::arg("periph_v_zero"),
+            nb::arg("far_k"), nb::arg("far_v"),
+            nb::arg("far_k_scale"), nb::arg("far_k_zero"),
+            nb::arg("far_v_scale"), nb::arg("far_v_zero"),
+            nb::arg("foveal_valid"),
+            nb::arg("spike_margin") = 0.5f,
+            nb::arg("max_ov") = 32,
+            "Create a handle with pre-bound static tier arrays.")
+        .def("__call__",
+            &foveated::FoveatedHandle::operator(),
+            nb::arg("query"),
+            nb::arg("decode_k"), nb::arg("decode_v"),
+            nb::arg("override_k"), nb::arg("override_v"),
+            nb::arg("override_far_idx"), nb::arg("override_count"),
+            "Dispatch with dynamic inputs only (7 arrays).");
+
     m.def("is_available", []() -> bool {
         try {
             auto q = zeros({1, 1, 1, 64}, float16);

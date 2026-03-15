@@ -451,4 +451,110 @@ std::vector<array> foveated_attention(
     };
 }
 
+// ---------------------------------------------------------------------------
+// FoveatedHandle: pre-bind static arrays, dispatch with dynamic only
+// ---------------------------------------------------------------------------
+
+static int adaptive_split_size(int s_total) {
+    const int base = 256;
+    const int max_splits = 16;
+    if (s_total <= base * max_splits) return base;
+    return ((s_total + max_splits - 1) / max_splits + 255) / 256 * 256;
+}
+
+FoveatedHandle::FoveatedHandle(
+    const array& foveal_k, const array& foveal_v,
+    const array& periph_k, const array& periph_v,
+    const array& periph_k_scale, const array& periph_k_zero,
+    const array& periph_v_scale, const array& periph_v_zero,
+    const array& far_k, const array& far_v,
+    const array& far_k_scale, const array& far_k_zero,
+    const array& far_v_scale, const array& far_v_zero,
+    const array& foveal_valid,
+    float spike_margin, int max_ov)
+    : foveal_k_(foveal_k), foveal_v_(foveal_v),
+      periph_k_(periph_k), periph_v_(periph_v),
+      periph_k_scale_(periph_k_scale), periph_k_zero_(periph_k_zero),
+      pv_s_(reshape(periph_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)})),
+      pv_z_(reshape(periph_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)})),
+      far_k_(far_k), far_v_(far_v),
+      far_k_scale_(far_k_scale), far_k_zero_(far_k_zero),
+      fv_s_(reshape(far_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)})),
+      fv_z_(reshape(far_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)})),
+      fov_valid_u32_(astype(foveal_valid, uint32)),
+      B_(foveal_k.shape(0)), H_kv_(foveal_k.shape(1)), D_(foveal_k.shape(3)),
+      N_fov_(foveal_k.shape(2)), N_per_(periph_k.shape(2)), N_far_(far_k.shape(2)),
+      N_static_(foveal_k.shape(2) + periph_k.shape(2) + far_k.shape(2)),
+      spike_margin_(spike_margin), max_ov_(max_ov)
+{
+}
+
+std::vector<array> FoveatedHandle::operator()(
+    const array& query,
+    const array& decode_k, const array& decode_v,
+    const array& override_k, const array& override_v,
+    const array& override_far_idx, const array& override_count)
+{
+    int H_q = query.shape(1);
+    int n_decode = decode_k.shape(2);
+    int total_bh_q = B_ * H_q;
+    int S_total = N_static_ + n_decode;
+    int split_size = adaptive_split_size(S_total);
+
+    // Build config for kernel lookup/compilation
+    Config cfg;
+    cfg.n_fov = N_fov_; cfg.n_per = N_per_; cfg.n_far = N_far_;
+    cfg.head_dim = D_; cfg.h_q = H_q; cfg.h_kv = H_kv_;
+    cfg.split_size = split_size;
+    cfg.max_ov = max_ov_;
+    cfg.spike_margin = spike_margin_;
+
+    const auto& kernels = get_kernels(cfg);
+
+    int num_splits = (S_total + split_size - 1) / split_size;
+    int partial_size = num_splits * total_bh_q;
+
+    // Only dynamic work: flatten query + build rt_params
+    auto q_flat = reshape(query, {total_bh_q, D_});
+    auto sk_rt = array({(uint32_t)total_bh_q, (uint32_t)n_decode}, uint32);
+
+    // Input list: rt_params + query(dynamic) + 15 static(pre-reshaped) + decode(dynamic) + overrides(dynamic)
+    std::vector<array> sk_inputs = {
+        sk_rt, q_flat,
+        foveal_k_, foveal_v_,
+        periph_k_, periph_v_, periph_k_scale_, periph_k_zero_, pv_s_, pv_z_,
+        far_k_, far_v_, far_k_scale_, far_k_zero_, fv_s_, fv_z_,
+        fov_valid_u32_,
+        decode_k, decode_v,
+        override_k, override_v, override_far_idx, override_count
+    };
+
+    auto partials = kernels.sk_fn(
+        sk_inputs,
+        {{partial_size, D_}, {partial_size}, {partial_size},
+         {partial_size}, {partial_size}, {partial_size}},
+        {float32, float32, float32, float32, float32, int32},
+        {num_splits * total_bh_q * 32, 1, 1},
+        {32, 1, 1},
+        {}, 0.0f, false, StreamOrDevice{});
+
+    auto red_rt = array({(uint32_t)num_splits, (uint32_t)total_bh_q}, uint32);
+    std::vector<array> red_inputs = {red_rt};
+    red_inputs.insert(red_inputs.end(), partials.begin(), partials.end());
+
+    auto outputs = kernels.red_fn(
+        red_inputs,
+        {{total_bh_q, D_}, {total_bh_q}, {total_bh_q}},
+        {float16, int32, int32},
+        {total_bh_q * 32, 1, 1},
+        {32, 1, 1},
+        {}, std::nullopt, false, StreamOrDevice{});
+
+    return {
+        reshape(outputs[0], {B_, H_q, 1, D_}),
+        reshape(outputs[1], {B_, H_q}),
+        reshape(outputs[2], {B_, H_q}),
+    };
+}
+
 } // namespace foveated

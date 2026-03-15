@@ -12,6 +12,8 @@ namespace foveated {
 
 // Direct-dispatch primitive. eval_gpu encodes Metal commands directly
 // via CommandEncoder — no fast::metal_kernel overhead.
+struct BufRef { const void* ptr; int64_t offset; };
+
 class FoveatedPrimitive : public mlx::core::Primitive {
  public:
     FoveatedPrimitive(
@@ -20,9 +22,8 @@ class FoveatedPrimitive : public mlx::core::Primitive {
         int head_dim, int h_q, int h_kv,
         int split_size, int max_ov,
         float spike_margin,
-        // Pre-bound static arrays (stored as inputs[0..14])
-        // Dynamic arrays are inputs[15..21]
-        int n_static_inputs);
+        int n_static_inputs,
+        std::vector<BufRef> static_bufs);
 
     void eval_cpu(const std::vector<mlx::core::array>& inputs,
                   std::vector<mlx::core::array>& outputs) override {
@@ -41,6 +42,7 @@ class FoveatedPrimitive : public mlx::core::Primitive {
     int split_size_, max_ov_;
     float spike_margin_;
     int n_static_;
+    std::vector<BufRef> static_bufs_;
 
     // Ensure Metal pipelines are compiled (lazy, cached globally)
     void ensure_pipelines_() const;
@@ -68,11 +70,16 @@ class FoveatedHandleDirect {
         const mlx::core::array& override_far_idx, const mlx::core::array& override_count);
 
  private:
-    // Pre-stored static arrays (15 total, some pre-reshaped)
+    // Static arrays kept alive by Python handle (prevent dealloc)
     std::vector<mlx::core::array> static_arrays_;
+    // Pre-extracted Metal buffer pointers + offsets (15 statics)
+    std::vector<BufRef> static_bufs_;
+    // Pre-allocated partial buffers
+    std::vector<mlx::core::array> partials_;
     int B_, H_kv_, D_, N_fov_, N_per_, N_far_, N_static_;
     float spike_margin_;
     int max_ov_;
+    int max_total_bh_q_;
 };
 
 } // namespace foveated

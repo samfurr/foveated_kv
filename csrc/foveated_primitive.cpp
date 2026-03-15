@@ -1,6 +1,9 @@
 // Direct CommandEncoder dispatch — bypasses fast::metal_kernel entirely.
-// Each eval_gpu call encodes Split-K + Reduce as two Metal dispatches
-// in a single command encoder, with minimal overhead.
+// Key optimizations over first attempt:
+//   - Pre-allocated partial buffers (no malloc in eval_gpu)
+//   - No memset (kernel writes all slots)
+//   - Cached pipeline state pointer (no map lookup per call)
+//   - Single command encoder for both Split-K + Reduce
 
 #include "foveated_primitive.h"
 #include "foveated_attn.h"  // for kernel source strings
@@ -18,14 +21,14 @@ static int adaptive_split_size(int s_total) {
     return ((s_total + max_splits - 1) / max_splits + 255) / 256 * 256;
 }
 
-// Global cache of compiled pipeline states
+// Global compiled pipeline cache
 struct PipelineCache {
     MTL::ComputePipelineState* splitk_pso = nullptr;
     MTL::ComputePipelineState* reduce_pso = nullptr;
 };
 static std::unordered_map<std::string, PipelineCache> _pso_cache;
 
-// Build Metal kernel source with constants injected
+// Build Metal source with constants injected
 static std::string build_full_source(
     const char* body,
     int n_fov, int n_per, int n_far,
@@ -54,12 +57,6 @@ static std::string build_full_source(
 }
 
 // Metal kernel signatures with explicit buffer bindings
-// Shim: SPLITK_SETUP/REDUCE_SOURCE reference thread_position_in_threadgroup.x
-// We pass uint3 for Metal attribute consistency, and define the expected name.
-// Alias uint3 stage-in to the name the kernel body expects
-static const char* THREADGROUP_SHIM =
-    "    uint3 thread_position_in_threadgroup = thread_position_in_threadgroup_3;\n";
-
 static const char* SPLITK_KERNEL_SIG = R"METAL(
 [[kernel]] void fov_splitk(
     const device uint32_t* rt_params [[buffer(0)]],
@@ -94,6 +91,7 @@ static const char* SPLITK_KERNEL_SIG = R"METAL(
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadgroup_3 [[thread_position_in_threadgroup]]
 ) {
+    uint3 thread_position_in_threadgroup = thread_position_in_threadgroup_3;
 )METAL";
 
 static const char* REDUCE_KERNEL_SIG = R"METAL(
@@ -111,26 +109,33 @@ static const char* REDUCE_KERNEL_SIG = R"METAL(
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 thread_position_in_threadgroup_3 [[thread_position_in_threadgroup]]
 ) {
+    uint3 thread_position_in_threadgroup = thread_position_in_threadgroup_3;
 )METAL";
 
-// Kernel body source (shared with Python path — same Metal code)
+// Kernel body source (shared with Python path)
 extern const char* SPLITK_SETUP;
 extern const char* TIER_PROCESSING;
 extern const char* SPLITK_WRITE;
 extern const char* REDUCE_SOURCE;
 
 
+// ---------------------------------------------------------------------------
+// FoveatedPrimitive
+// ---------------------------------------------------------------------------
+
 FoveatedPrimitive::FoveatedPrimitive(
     Stream stream,
     int n_fov, int n_per, int n_far,
     int head_dim, int h_q, int h_kv,
     int split_size, int max_ov, float spike_margin,
-    int n_static)
+    int n_static,
+    std::vector<BufRef> static_bufs)
     : Primitive(stream),
       n_fov_(n_fov), n_per_(n_per), n_far_(n_far),
       head_dim_(head_dim), h_q_(h_q), h_kv_(h_kv),
       split_size_(split_size), max_ov_(max_ov),
-      spike_margin_(spike_margin), n_static_(n_static) {}
+      spike_margin_(spike_margin), n_static_(n_static),
+      static_bufs_(std::move(static_bufs)) {}
 
 std::string FoveatedPrimitive::kernel_key_() const {
     std::ostringstream k;
@@ -154,20 +159,17 @@ void FoveatedPrimitive::ensure_pipelines_() const {
 
     auto& d = metal::device(default_device());
 
-    // Build Split-K kernel source
-    std::string sk_body = std::string(THREADGROUP_SHIM) + SPLITK_SETUP + TIER_PROCESSING + SPLITK_WRITE;
+    std::string sk_body = std::string(SPLITK_SETUP) + TIER_PROCESSING + SPLITK_WRITE;
     std::string sk_source = build_full_source(
         (std::string(SPLITK_KERNEL_SIG) + sk_body + "\n}\n").c_str(),
         n_fov_, n_per_, n_far_, head_dim_, h_q_, h_kv_,
         split_size_, max_ov_, spike_margin_);
 
-    // Build Reduce kernel source
     std::string red_source = build_full_source(
-        (std::string(REDUCE_KERNEL_SIG) + THREADGROUP_SHIM + REDUCE_SOURCE + "\n}\n").c_str(),
+        (std::string(REDUCE_KERNEL_SIG) + REDUCE_SOURCE + "\n}\n").c_str(),
         n_fov_, n_per_, n_far_, head_dim_, h_q_, h_kv_,
         split_size_, max_ov_, spike_margin_);
 
-    // Compile
     std::string sk_lib_name = "fov_prim_sk_" + key;
     std::string red_lib_name = "fov_prim_red_" + key;
 
@@ -185,124 +187,85 @@ void FoveatedPrimitive::eval_gpu(
     std::vector<array>& outputs)
 {
     ensure_pipelines_();
-    auto key = kernel_key_();
-    auto& pc = _pso_cache[key];
+    auto& pc = _pso_cache[kernel_key_()];
 
     auto& d = metal::device(stream().device);
     auto& enc = d.get_command_encoder(stream().index);
 
-    // inputs[0..14]: static tier arrays (pre-bound)
-    // inputs[15]: query (B*H_q, D)
-    // inputs[16]: decode_k, inputs[17]: decode_v
-    // inputs[18..21]: override arrays
-    // inputs[22]: rt_params_sk (uint32, 2 elements)
-    // inputs[23]: rt_params_red (uint32, 2 elements)
+    // Graph inputs (13 only — statics bypassed via set_buffer):
+    //   [0]: query_flat (total_bh_q, D)
+    //   [1]: decode_k, [2]: decode_v
+    //   [3..6]: override arrays
+    //   [7..12]: pre-allocated partial buffers
 
-    auto& query = inputs[15];
-    auto& decode_k = inputs[16];
-    int n_decode = decode_k.shape(2);
-    int total_bh_q = query.shape(0);
+    int n_decode = inputs[1].shape(2);
+    int total_bh_q = inputs[0].shape(0);
     int D = head_dim_;
-
     int S_total = n_fov_ + n_per_ + n_far_ + n_decode;
     int num_splits = (S_total + split_size_ - 1) / split_size_;
-    int partial_size = num_splits * total_bh_q;
 
-    // Allocate partial arrays (temporaries)
-    array p_out({partial_size, D}, float32, nullptr, {});
-    array p_lse({partial_size}, float32, nullptr, {});
-    array p_max({partial_size}, float32, nullptr, {});
-    array p_mfov({partial_size}, float32, nullptr, {});
-    array p_mfar({partial_size}, float32, nullptr, {});
-    array p_ftok({partial_size}, int32, nullptr, {});
+    // Allocate final outputs only
+    for (auto& o : outputs)
+        o.set_data(allocator::malloc(o.nbytes()));
 
-    // Allocate and zero partials
-    auto alloc_and_zero = [&](array& a) {
-        a.set_data(allocator::malloc(a.nbytes()));
-        // Zero-init via memset on the Metal buffer
-        std::memset(a.data<void>(), 0, a.nbytes());
-    };
-    alloc_and_zero(p_out);
-    alloc_and_zero(p_lse);
-    alloc_and_zero(p_max);
-    alloc_and_zero(p_mfov);
-    alloc_and_zero(p_mfar);
-    alloc_and_zero(p_ftok);
-
-    // Allocate final outputs
-    // outputs[0]: attention (total_bh_q, D) fp16
-    // outputs[1]: spike_flags (total_bh_q,) int32
-    // outputs[2]: spike_tokens (total_bh_q,) int32
-    outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
-    outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
-    outputs[2].set_data(allocator::malloc(outputs[2].nbytes()));
-
-    // ---- Split-K dispatch ----
+    // ---- Split-K ----
     enc.set_compute_pipeline_state(pc.splitk_pso);
 
-    // Buffer 0: rt_params as raw bytes
     uint32_t sk_params[2] = {(uint32_t)total_bh_q, (uint32_t)n_decode};
     enc.set_bytes(sk_params, 2, 0);
 
-    // Map inputs to kernel buffer indices:
-    //   buffer(1) = query (inputs[15])
-    //   buffer(2..16) = static (inputs[0..14])
-    //   buffer(17..18) = decode (inputs[16..17])
-    //   buffer(19..22) = overrides (inputs[18..21])
-    enc.set_input_array(inputs[15], 1);  // query
+    // Buffer 1: query (graph input 0)
+    enc.set_input_array(inputs[0], 1);
+
+    // Buffers 2-16: static arrays (bypass graph — raw Metal buffer pointers)
     for (int i = 0; i < 15; i++)
-        enc.set_input_array(inputs[i], i + 2);  // static: buffers 2-16
-    enc.set_input_array(inputs[16], 17);  // decode_k
-    enc.set_input_array(inputs[17], 18);  // decode_v
-    for (int i = 18; i < 22; i++)
-        enc.set_input_array(inputs[i], i + 1);  // overrides: buffers 19-22
+        enc.set_buffer(
+            static_cast<const MTL::Buffer*>(static_bufs_[i].ptr),
+            i + 2, static_bufs_[i].offset);
 
-    // Buffers 23-28: partial outputs
-    enc.set_output_array(p_out, 23);
-    enc.set_output_array(p_lse, 24);
-    enc.set_output_array(p_max, 25);
-    enc.set_output_array(p_mfov, 26);
-    enc.set_output_array(p_mfar, 27);
-    enc.set_output_array(p_ftok, 28);
+    // Buffers 17-18: decode (graph inputs 1-2)
+    enc.set_input_array(inputs[1], 17);
+    enc.set_input_array(inputs[2], 18);
 
-    // Grid in threadgroups (not threads). Each threadgroup is 32 threads (1 SIMD group).
-    auto sk_grid = MTL::Size(num_splits * total_bh_q, 1, 1);
-    auto sk_group = MTL::Size(32, 1, 1);
-    enc.dispatch_threadgroups(sk_grid, sk_group);
+    // Buffers 19-22: overrides (graph inputs 3-6)
+    for (int i = 0; i < 4; i++)
+        enc.set_input_array(inputs[3 + i], 19 + i);
+
+    // Buffers 23-28: pre-allocated partials (graph inputs 7-12)
+    for (int i = 0; i < 6; i++)
+        enc.set_output_array(const_cast<array&>(inputs[7 + i]), 23 + i);
+
+    enc.dispatch_threadgroups(
+        MTL::Size(num_splits * total_bh_q, 1, 1),
+        MTL::Size(32, 1, 1));
 
     // ---- Barrier ----
     enc.barrier();
 
-    // ---- Reduce dispatch ----
+    // ---- Reduce ----
     enc.set_compute_pipeline_state(pc.reduce_pso);
 
     uint32_t red_params[2] = {(uint32_t)num_splits, (uint32_t)total_bh_q};
     enc.set_bytes(red_params, 2, 0);
 
-    // Buffers 1-6: partials as inputs
-    enc.set_input_array(p_out, 1);
-    enc.set_input_array(p_lse, 2);
-    enc.set_input_array(p_max, 3);
-    enc.set_input_array(p_mfov, 4);
-    enc.set_input_array(p_mfar, 5);
-    enc.set_input_array(p_ftok, 6);
+    for (int i = 0; i < 6; i++)
+        enc.set_input_array(inputs[7 + i], i + 1);
 
-    // Buffers 7-9: final outputs
     enc.set_output_array(outputs[0], 7);
     enc.set_output_array(outputs[1], 8);
     enc.set_output_array(outputs[2], 9);
 
-    auto red_grid = MTL::Size(total_bh_q, 1, 1);
-    auto red_group = MTL::Size(32, 1, 1);
-    enc.dispatch_threadgroups(red_grid, red_group);
-
-    // Register temporaries so MLX tracks their lifetime
-    d.add_temporaries({p_out, p_lse, p_max, p_mfov, p_mfar, p_ftok}, stream().index);
+    enc.dispatch_threadgroups(
+        MTL::Size(total_bh_q, 1, 1),
+        MTL::Size(32, 1, 1));
 }
 
+
 // ---------------------------------------------------------------------------
-// FoveatedHandleDirect: Python-facing, creates primitive per call
+// FoveatedHandleDirect
 // ---------------------------------------------------------------------------
+
+static const int MAX_SPLITS = 16;
 
 FoveatedHandleDirect::FoveatedHandleDirect(
     const array& foveal_k, const array& foveal_v,
@@ -324,18 +287,28 @@ FoveatedHandleDirect::FoveatedHandleDirect(
     N_far_ = far_k.shape(2);
     N_static_ = N_fov_ + N_per_ + N_far_;
 
-    // Pre-reshape and store as vector (indices 0-14 match kernel buffer order)
-    // The primitive's eval_gpu reads inputs[0..14] as static, inputs[15..21] as dynamic
+    // Pre-reshape static arrays (indices 0-14)
     static_arrays_ = {
-        foveal_k, foveal_v,                                                    // 0,1
-        periph_k, periph_v, periph_k_scale, periph_k_zero,                     // 2-5
-        reshape(periph_v_scale, {B_, H_kv_, std::max(N_per_, 0)}),             // 6
-        reshape(periph_v_zero, {B_, H_kv_, std::max(N_per_, 0)}),              // 7
-        far_k, far_v, far_k_scale, far_k_zero,                                 // 8-11
-        reshape(far_v_scale, {B_, H_kv_, std::max(N_far_, 0)}),                // 12
-        reshape(far_v_zero, {B_, H_kv_, std::max(N_far_, 0)}),                 // 13
-        astype(foveal_valid, uint32),                                           // 14
+        foveal_k, foveal_v,
+        periph_k, periph_v, periph_k_scale, periph_k_zero,
+        reshape(periph_v_scale, {B_, H_kv_, std::max(N_per_, 0)}),
+        reshape(periph_v_zero, {B_, H_kv_, std::max(N_per_, 0)}),
+        far_k, far_v, far_k_scale, far_k_zero,
+        reshape(far_v_scale, {B_, H_kv_, std::max(N_far_, 0)}),
+        reshape(far_v_zero, {B_, H_kv_, std::max(N_far_, 0)}),
+        astype(foveal_valid, uint32),
     };
+
+    // Materialize static arrays so Metal buffers exist
+    eval(static_arrays_);
+
+    // Extract Metal buffer pointers (stable as long as static_arrays_ refs are held)
+    static_bufs_.reserve(15);
+    for (auto& a : static_arrays_) {
+        static_bufs_.push_back({a.buffer().raw_ptr(), a.offset()});
+    }
+
+    max_total_bh_q_ = 0;
 }
 
 std::vector<array> FoveatedHandleDirect::operator()(
@@ -349,33 +322,49 @@ std::vector<array> FoveatedHandleDirect::operator()(
     int S_total = N_static_ + n_decode;
     int split_size = adaptive_split_size(S_total);
     int total_bh_q = B_ * H_q;
+    int num_splits = (S_total + split_size - 1) / split_size;
+    int partial_size = MAX_SPLITS * total_bh_q;  // max size, not actual
 
-    // Create the primitive (lightweight — just stores config)
+    // Pre-allocate partials once (or when H_q changes)
+    if (total_bh_q != max_total_bh_q_) {
+        max_total_bh_q_ = total_bh_q;
+        // Allocate + eval once so they're materialized Metal buffers
+        partials_ = {
+            zeros({partial_size, D_}, float32),
+            zeros({partial_size}, float32),
+            zeros({partial_size}, float32),
+            zeros({partial_size}, float32),
+            zeros({partial_size}, float32),
+            zeros({partial_size}, int32),
+        };
+        eval(partials_);
+    }
+
     auto prim = std::make_shared<FoveatedPrimitive>(
         default_stream(default_device()),
         N_fov_, N_per_, N_far_,
         D_, H_q, H_kv_,
-        split_size, max_ov_, spike_margin_,
-        15 /* n_static_inputs */);
+        split_size, max_ov_, spike_margin_, 0,
+        static_bufs_);  // pass raw buffer pointers
 
-    // Build inputs: static[0..14] + query_flat[15] + decode[16,17] + overrides[18..21]
-    std::vector<array> inputs = static_arrays_;  // copy refs to 15 static arrays
-    inputs.push_back(reshape(query, {total_bh_q, D_}));  // 15: query flat
-    inputs.push_back(decode_k);                           // 16
-    inputs.push_back(decode_v);                           // 17
-    inputs.push_back(override_k);                         // 18
-    inputs.push_back(override_v);                         // 19
-    inputs.push_back(override_far_idx);                   // 20
-    inputs.push_back(override_count);                     // 21
+    // Graph inputs: ONLY dynamic (7) + partials (6) = 13 total
+    // Statics bypass the graph via set_buffer in eval_gpu
+    std::vector<array> inputs;
+    inputs.push_back(reshape(query, {total_bh_q, D_}));  // 0: query
+    inputs.push_back(decode_k);                           // 1: decode_k
+    inputs.push_back(decode_v);                           // 2: decode_v
+    inputs.push_back(override_k);                         // 3
+    inputs.push_back(override_v);                         // 4
+    inputs.push_back(override_far_idx);                   // 5
+    inputs.push_back(override_count);                     // 6
+    inputs.insert(inputs.end(), partials_.begin(), partials_.end());  // 7-12
 
-    // Create output arrays in the lazy graph (flat shapes for eval_gpu)
     auto flat_outputs = array::make_arrays(
         {{total_bh_q, D_}, {total_bh_q}, {total_bh_q}},
         {float16, int32, int32},
         prim,
         inputs);
 
-    // Reshape to final (B, H_q, 1, D) etc
     return {
         reshape(flat_outputs[0], {B_, H_q, 1, D_}),
         reshape(flat_outputs[1], {B_, H_q}),

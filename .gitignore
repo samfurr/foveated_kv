@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.so
+
+# Virtual environments
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Benchmark results (regenerated per run)
+results/
+
+# Personal docs (not for public repo)
+docs/portfolio.md
+docs/blog_draft.md
+docs/social_strategy.md
+
+# LongBench data cache
+.cache/
+
+# OS
+.DS_Store
+
+# Pytest
+.pytest_cache/

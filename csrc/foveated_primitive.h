@@ -23,7 +23,7 @@ class FoveatedPrimitive : public mlx::core::Primitive {
         int split_size, int max_ov,
         float spike_margin,
         int n_static_inputs,
-        std::vector<BufRef> static_bufs);
+        std::vector<mlx::core::array> static_arrays);
 
     void eval_cpu(const std::vector<mlx::core::array>& inputs,
                   std::vector<mlx::core::array>& outputs) override {
@@ -42,7 +42,8 @@ class FoveatedPrimitive : public mlx::core::Primitive {
     int split_size_, max_ov_;
     float spike_margin_;
     int n_static_;
-    std::vector<BufRef> static_bufs_;
+    std::vector<BufRef> static_bufs_;  // unused for now (MTL::Buffer access blocked)
+    std::vector<mlx::core::array> static_arrays_;  // held by primitive for set_input_array
 
     // Ensure Metal pipelines are compiled (lazy, cached globally)
     void ensure_pipelines_() const;

@@ -25,6 +25,7 @@ static int adaptive_split_size(int s_total) {
 struct PipelineCache {
     MTL::ComputePipelineState* splitk_pso = nullptr;
     MTL::ComputePipelineState* reduce_pso = nullptr;
+    MTL::ComputePipelineState* singlepass_pso = nullptr;
 };
 static std::unordered_map<std::string, PipelineCache> _pso_cache;
 
@@ -118,6 +119,99 @@ extern const char* TIER_PROCESSING;
 extern const char* SPLITK_WRITE;
 extern const char* REDUCE_SOURCE;
 
+// Single-pass kernel: one threadgroup per bh_q, processes ALL tokens.
+// No partials, no reduce, no barrier. 23 inputs + 3 outputs.
+static const char* SINGLEPASS_KERNEL_SIG = R"METAL(
+[[kernel]] void fov_singlepass(
+    const device uint32_t* rt_params [[buffer(0)]],
+    const device half* query [[buffer(1)]],
+    const device half* foveal_k [[buffer(2)]],
+    const device half* foveal_v [[buffer(3)]],
+    const device uint8_t* periph_k [[buffer(4)]],
+    const device uint8_t* periph_v [[buffer(5)]],
+    const device half* periph_k_scale [[buffer(6)]],
+    const device half* periph_k_zero [[buffer(7)]],
+    const device half* periph_v_scale [[buffer(8)]],
+    const device half* periph_v_zero [[buffer(9)]],
+    const device uint8_t* far_k [[buffer(10)]],
+    const device uint8_t* far_v [[buffer(11)]],
+    const device half* far_k_scale [[buffer(12)]],
+    const device half* far_k_zero [[buffer(13)]],
+    const device half* far_v_scale [[buffer(14)]],
+    const device half* far_v_zero [[buffer(15)]],
+    const device uint32_t* foveal_valid [[buffer(16)]],
+    const device half* decode_k [[buffer(17)]],
+    const device half* decode_v [[buffer(18)]],
+    const device half* override_k [[buffer(19)]],
+    const device half* override_v [[buffer(20)]],
+    const device int32_t* override_far_idx [[buffer(21)]],
+    const device int32_t* override_count [[buffer(22)]],
+    device half* out [[buffer(23)]],
+    device int32_t* spike_flags [[buffer(24)]],
+    device int32_t* spike_tokens [[buffer(25)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 thread_position_in_threadgroup_3 [[thread_position_in_threadgroup]]
+) {
+    uint3 thread_position_in_threadgroup = thread_position_in_threadgroup_3;
+)METAL";
+
+// Single-pass setup: no split partitioning, process all tokens
+static const char* SINGLEPASS_SETUP = R"METAL(
+    uint TOTAL_BH_Q = rt_params[0];
+    uint N_DECODE    = rt_params[1];
+
+    uint bh_q      = threadgroup_position_in_grid.x;
+    uint batch_idx = bh_q / H_Q;
+    uint q_head    = bh_q % H_Q;
+    uint kv_head   = q_head / GQA_RATIO;
+    uint lane_id   = thread_position_in_threadgroup.x;
+
+    uint bh_kv = batch_idx * H_KV + kv_head;
+
+    float q_reg[CPT];
+    for (uint c = 0; c < CPT; c++)
+        q_reg[c] = (float)query[bh_q * HEAD_DIM + lane_id * CPT + c];
+
+    float pk_s[CPT], pk_z[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        uint d = lane_id * CPT + c;
+        pk_s[c] = (float)periph_k_scale[bh_kv * HEAD_DIM + d];
+        pk_z[c] = (float)periph_k_zero[bh_kv * HEAD_DIM + d];
+    }
+    float fk_s[CPT], fk_z[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        uint d = lane_id * CPT + c;
+        fk_s[c] = (float)far_k_scale[bh_kv * HEAD_DIM + d];
+        fk_z[c] = (float)far_k_zero[bh_kv * HEAD_DIM + d];
+    }
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[CPT];
+    for (uint c = 0; c < CPT; c++) acc[c] = 0.0f;
+    float min_fov_score = INFINITY, max_far_score = -INFINITY;
+    int max_far_token = -1;
+
+    // Process ALL tokens — no split partitioning
+    uint fov_start = 0, fov_end = N_FOV;
+    uint per_start = 0, per_end = N_PER;
+    uint far_start = 0, far_end = N_FAR;
+    uint dec_start = 0, dec_end = N_DECODE;
+)METAL";
+
+// Single-pass output: normalize and write directly
+static const char* SINGLEPASS_OUTPUT = R"METAL(
+    // Normalize
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (uint c = 0; c < CPT; c++)
+        out[bh_q * HEAD_DIM + lane_id * CPT + c] = (half)(acc[c] * inv_l);
+
+    // Spike detection
+    if (lane_id == 0) {
+        spike_flags[bh_q]  = (max_far_score > min_fov_score + SPIKE_MARGIN) ? 1 : 0;
+        spike_tokens[bh_q] = max_far_token;
+    }
+)METAL";
+
 
 // ---------------------------------------------------------------------------
 // FoveatedPrimitive
@@ -129,13 +223,13 @@ FoveatedPrimitive::FoveatedPrimitive(
     int head_dim, int h_q, int h_kv,
     int split_size, int max_ov, float spike_margin,
     int n_static,
-    std::vector<BufRef> static_bufs)
+    std::vector<array> static_arrays)
     : Primitive(stream),
       n_fov_(n_fov), n_per_(n_per), n_far_(n_far),
       head_dim_(head_dim), h_q_(h_q), h_kv_(h_kv),
       split_size_(split_size), max_ov_(max_ov),
       spike_margin_(spike_margin), n_static_(n_static),
-      static_bufs_(std::move(static_bufs)) {}
+      static_arrays_(std::move(static_arrays)) {}
 
 std::string FoveatedPrimitive::kernel_key_() const {
     std::ostringstream k;
@@ -176,9 +270,20 @@ void FoveatedPrimitive::ensure_pipelines_() const {
     auto* sk_lib = d.get_library(sk_lib_name, [&]() { return sk_source; });
     auto* red_lib = d.get_library(red_lib_name, [&]() { return red_source; });
 
+    // Single-pass kernel (no partials, one dispatch)
+    std::string sp_body = std::string(SINGLEPASS_SETUP) + TIER_PROCESSING + SINGLEPASS_OUTPUT;
+    std::string sp_source = build_full_source(
+        (std::string(SINGLEPASS_KERNEL_SIG) + sp_body + "\n}\n").c_str(),
+        n_fov_, n_per_, n_far_, head_dim_, h_q_, h_kv_,
+        split_size_, max_ov_, spike_margin_);
+
+    std::string sp_lib_name = "fov_prim_sp_" + key;
+    auto* sp_lib = d.get_library(sp_lib_name, [&]() { return sp_source; });
+
     PipelineCache pc;
     pc.splitk_pso = d.get_kernel("fov_splitk", sk_lib);
     pc.reduce_pso = d.get_kernel("fov_reduce", red_lib);
+    pc.singlepass_pso = d.get_kernel("fov_singlepass", sp_lib);
     _pso_cache[key] = pc;
 }
 
@@ -192,68 +297,41 @@ void FoveatedPrimitive::eval_gpu(
     auto& d = metal::device(stream().device);
     auto& enc = d.get_command_encoder(stream().index);
 
-    // Graph inputs (13 only — statics bypassed via set_buffer):
+    // Graph inputs (7 dynamic only — no statics, no partials):
     //   [0]: query_flat (total_bh_q, D)
     //   [1]: decode_k, [2]: decode_v
     //   [3..6]: override arrays
-    //   [7..12]: pre-allocated partial buffers
 
     int n_decode = inputs[1].shape(2);
     int total_bh_q = inputs[0].shape(0);
     int D = head_dim_;
-    int S_total = n_fov_ + n_per_ + n_far_ + n_decode;
-    int num_splits = (S_total + split_size_ - 1) / split_size_;
 
-    // Allocate final outputs only
+    // Allocate final outputs
     for (auto& o : outputs)
         o.set_data(allocator::malloc(o.nbytes()));
 
-    // ---- Split-K ----
-    enc.set_compute_pipeline_state(pc.splitk_pso);
+    // Single-pass kernel: one threadgroup per bh_q, ALL tokens in one pass.
+    // No partials, no reduce, no barrier. 23 inputs + 3 outputs.
+    enc.set_compute_pipeline_state(pc.singlepass_pso);
 
-    uint32_t sk_params[2] = {(uint32_t)total_bh_q, (uint32_t)n_decode};
-    enc.set_bytes(sk_params, 2, 0);
+    uint32_t rt_params[2] = {(uint32_t)total_bh_q, (uint32_t)n_decode};
+    enc.set_bytes(rt_params, 2, 0);
 
-    // Buffer 1: query (graph input 0)
+    // Buffer 1: query
     enc.set_input_array(inputs[0], 1);
-
-    // Buffers 2-16: static arrays (bypass graph — raw Metal buffer pointers)
+    // Buffers 2-16: static arrays (stored on primitive, bypass graph)
     for (int i = 0; i < 15; i++)
-        enc.set_buffer(
-            static_cast<const MTL::Buffer*>(static_bufs_[i].ptr),
-            i + 2, static_bufs_[i].offset);
-
-    // Buffers 17-18: decode (graph inputs 1-2)
+        enc.set_input_array(static_arrays_[i], i + 2);
+    // Buffers 17-18: decode
     enc.set_input_array(inputs[1], 17);
     enc.set_input_array(inputs[2], 18);
-
-    // Buffers 19-22: overrides (graph inputs 3-6)
+    // Buffers 19-22: overrides
     for (int i = 0; i < 4; i++)
         enc.set_input_array(inputs[3 + i], 19 + i);
-
-    // Buffers 23-28: pre-allocated partials (graph inputs 7-12)
-    for (int i = 0; i < 6; i++)
-        enc.set_output_array(const_cast<array&>(inputs[7 + i]), 23 + i);
-
-    enc.dispatch_threadgroups(
-        MTL::Size(num_splits * total_bh_q, 1, 1),
-        MTL::Size(32, 1, 1));
-
-    // ---- Barrier ----
-    enc.barrier();
-
-    // ---- Reduce ----
-    enc.set_compute_pipeline_state(pc.reduce_pso);
-
-    uint32_t red_params[2] = {(uint32_t)num_splits, (uint32_t)total_bh_q};
-    enc.set_bytes(red_params, 2, 0);
-
-    for (int i = 0; i < 6; i++)
-        enc.set_input_array(inputs[7 + i], i + 1);
-
-    enc.set_output_array(outputs[0], 7);
-    enc.set_output_array(outputs[1], 8);
-    enc.set_output_array(outputs[2], 9);
+    // Buffers 23-25: final outputs
+    enc.set_output_array(outputs[0], 23);
+    enc.set_output_array(outputs[1], 24);
+    enc.set_output_array(outputs[2], 25);
 
     enc.dispatch_threadgroups(
         MTL::Size(total_bh_q, 1, 1),
@@ -345,10 +423,9 @@ std::vector<array> FoveatedHandleDirect::operator()(
         N_fov_, N_per_, N_far_,
         D_, H_q, H_kv_,
         split_size, max_ov_, spike_margin_, 0,
-        static_bufs_);  // pass raw buffer pointers
+        static_arrays_);  // primitive holds refs to static arrays
 
-    // Graph inputs: ONLY dynamic (7) + partials (6) = 13 total
-    // Statics bypass the graph via set_buffer in eval_gpu
+    // Graph inputs: ONLY 7 dynamic arrays (statics on primitive, no partials)
     std::vector<array> inputs;
     inputs.push_back(reshape(query, {total_bh_q, D_}));  // 0: query
     inputs.push_back(decode_k);                           // 1: decode_k
@@ -357,7 +434,6 @@ std::vector<array> FoveatedHandleDirect::operator()(
     inputs.push_back(override_v);                         // 4
     inputs.push_back(override_far_idx);                   // 5
     inputs.push_back(override_count);                     // 6
-    inputs.insert(inputs.end(), partials_.begin(), partials_.end());  // 7-12
 
     auto flat_outputs = array::make_arrays(
         {{total_bh_q, D_}, {total_bh_q}, {total_bh_q}},

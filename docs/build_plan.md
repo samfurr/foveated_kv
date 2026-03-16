@@ -39,16 +39,19 @@ benchmarks/
 
 | Context | fp16 SDPA | Fused Kernel | Speedup |
 |---------|-----------|-------------|---------|
-| 1K | 7.5ms | 7.5ms | 1.0x |
-| 4K | 7.8ms | 7.7ms | 1.0x |
-| 16K | 9.4ms | 7.8ms | 1.2x |
-| 32K | 75ms | 8.4ms | **8.9x** |
-| 64K | 83ms | 16ms | **5.2x** |
-| 128K | 271ms | 27ms | **10.2x** |
+| 512 | 7.8ms | 7.6ms | 1.0x |
+| 4K | 7.7ms | 8.0ms | 1.0x |
+| 16K | 8.9ms | 8.2ms | 1.1x |
+| 32K | 121ms | 15ms | 7.9x |
+| 64K | 109ms | 25ms | 4.4x |
+| 128K | 317ms | 46ms | 7.0x |
 
-Crossover at ~16K tokens. The fused kernel reads INT8/INT4 quantized data
-directly from memory while Apple's SDPA reads full fp16. At 32K+ where
-decode is bandwidth-bound, the 2-4x byte reduction dominates.
+**Note**: Apple's SDPA hits a performance cliff at 32K+ (likely a cache
+threshold or kernel path switch). Our fused kernel scales smoothly
+(8ms → 15ms → 25ms → 46ms). The large speedup numbers at 32K+ are
+partly real bandwidth savings and partly the SDPA cliff — the exact
+contribution is inconclusive. Needs testing on larger hardware with
+models that exercise long context properly to separate the two effects.
 
 ## Quality
 
@@ -92,14 +95,15 @@ pre-packs 11 static arrays into a single uint8 blob. Merged kernel with
 
 ## End-to-End Status
 
-Kernel-only: at parity with Apple's SDPA at short context, 10x faster
-at 128K. End-to-end on 0.5B model: ~4.4x overhead from MLX's CustomKernel
-evaluator (internal to libmlx.dylib). The kernel compute is fast — the
-overhead is per-node graph evaluation cost for custom vs built-in primitives.
+Kernel-only: at parity with Apple's SDPA at short context, scales
+smoothly at long context where SDPA degrades. End-to-end on 0.5B model:
+~4.4x overhead from MLX's CustomKernel evaluator (internal to
+libmlx.dylib). The kernel compute is fast — the overhead is per-node
+graph evaluation cost for custom vs built-in primitives.
 
-At 32K+ context, the kernel speedup (10x) overcomes the evaluator overhead
-for a significant net win. The 0.5B model at short context is the worst
-case (weight-bound, KV cache is small, evaluator overhead dominates).
+The 0.5B model at short context is the worst case (weight-bound, KV
+cache is small, evaluator overhead dominates). Needs testing on larger
+models at longer context to characterize the real-world crossover.
 
 ## Tests
 

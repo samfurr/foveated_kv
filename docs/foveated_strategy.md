@@ -223,23 +223,35 @@ This bound is INDEPENDENT of decode step t -- it does not grow with time.
 Confirmed empirically: PPL ratio stays flat across 1K-4K context.
 ```
 
-## Sustained Accuracy Finding
+## Sustained Accuracy + Promotion
 
-Empirical validation at 4K context, 200 decode tokens: frozen foveated tiers
-maintain 0.9998 cosine similarity to standard fp16 with ZERO drift. The initial
-tier assignment from compression remains correct throughout generation — quality
-actually improves slightly as generated tokens reinforce the compressed context.
+Frozen foveated tiers maintain 0.996+ cosine similarity to standard fp16
+across all context lengths. The override buffer provides lossless promotion:
 
-The async promotion pipeline uses a shared-memory override buffer:
 - Metal kernel detects spikes as a free byproduct of online softmax
 - Background worker reads exact fp16 from NVMe mmap archive (~50us/token)
 - Worker does sorted insert into double-buffered numpy arrays + atomic swap
 - Kernel merge-scans the pre-sorted buffer: O(N_FAR + MAX_OV) per layer
 - No tensor mutation during decode, no GPU faults, no locks
 
-**Conclusion**: Static foveated compression with promotion via override buffer
-is production-ready. The override buffer eliminates the GPU fault issues from
-direct tensor mutation while providing unlimited promotion throughput.
+Tier assignment uses pure recency (sinks + recent window → foveal, rest by
+distance). Deterministic, fast, no argpartition non-determinism. Promotion
+via override buffer rescues important early tokens that land in the far tier.
+
+## Kernel Architecture
+
+The fused kernel merges Split-K + Reduce into a single Metal dispatch via
+threadgroup shared memory. Multiple SIMD groups per threadgroup (one per
+split), each processes a token range in parallel. After a threadgroup barrier,
+the first SIMD group reduces all partials and writes the final output.
+
+Adaptive split_size caps num_splits ≤ 16 to avoid reduce bottleneck at long
+contexts (256 base, growing to 8192 at 128K). Single dispatch eliminates
+the second kernel and 6 global partial buffer arrays.
+
+Scale+zero pairs are pre-packed during compression (concat once, not per call).
+C++ extension packs all 11 static arrays into a single uint8 blob with
+16-byte alignment — 9 Metal buffer arguments total per dispatch.
 
 ## Kernel Precision: fp16 Dequant Rounding
 

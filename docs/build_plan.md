@@ -1,153 +1,113 @@
 # FoveatedKV Build Status
 
-## Status: MLX Native Implementation Complete
-
-### MLX Production Path (implemented)
+## Architecture
 
 ```
 src/mipmap_kv/
   mlx_foveated.py        -- MLXFoveatedKVCache, MLXFoveatedLayer, MLXTierConfig
-                            3 precision tiers + decode buffer, per-head assignment
-  mlx_quantize.py        -- INT8 per-channel/per-token + INT4 packed (MLX native)
-                            Matches PyTorch reference exactly
-  metal_foveated.py      -- Fused Split-K Metal kernel
-                            Register-only K dequant, online softmax across all tiers
-                            Spike detection piggybacked, compile-time N_FOV
-  mlx_async_promoter.py  -- 2 background workers (spike processing + disk reads)
-                            Fire-and-forget spike handoff, O(1) drain by layer
+                            3 precision tiers + decode buffer
+                            Recency-based tier assignment (deterministic)
+                            Kernel cache with pre-packed static arrays
+  mlx_quantize.py        -- INT8 per-channel/per-token + INT4 packed
+  metal_foveated.py      -- Fused merged Metal kernel (Split-K + Reduce in
+                            one dispatch via threadgroup shared memory)
+                            Adaptive split_size, packed scale+zero inputs
+                            Override buffer merge-scan, kernel-side spike detection
+  mlx_async_promoter.py  -- Shared-memory override buffer (double-buffered, sorted)
+                            Background workers: spike processing + disk reads
                             numpy-only workers (no MLX in threads)
-  mlx_generate.py        -- SDPA monkey-patch for mlx-lm
-                            Intercepts mx.fast.scaled_dot_product_attention
-                            FusedCacheWrapper, generate_fused, prefill_and_compress
+  mlx_generate.py        -- SDPA monkey-patch for mlx-lm integration
+                            FusedCacheWrapper, kernel-side spike collection
   disk_archive.py        -- NVMe-backed numpy.memmap fp16 archive
-                            One file per layer, ~50us/token read
-```
 
-### PyTorch Reference Path (maintained for validation)
+csrc/
+  foveated_attn.h/.cpp   -- C++ FoveatedHandle (nanobind extension)
+                            Pre-packed blob of 11 static arrays → 1 buffer
+                            Merged kernel dispatch (9 inputs total)
+  bindings.cpp            -- nanobind bindings (NB_DOMAIN mlx for type sharing)
+  CMakeLists.txt          -- Build against MLX headers + nanobind 2.10.2
 
-```
-src/mipmap_kv/
-  foveated.py            -- FoveatedKVCache, FoveatedLayer, TierConfig
-                            Golden standard for correctness validation
-  quantize.py            -- INT8 per-channel/per-token + INT4 packed (PyTorch)
-  patch.py               -- SDPA interception for HuggingFace models
-  async_manager.py       -- Central async tier manager (PyTorch reference)
-```
-
-### Removed (from earlier CUDA/A100 phase)
-
-- `csrc/` directory (CUDA kernels)
-- `setup_cuda.py` (CUDA build script)
-- Triton kernel (`triton_foveated.py`)
-- FlashInfer integration
-- Cloud deployment scripts (vast.ai)
-
-### Benchmarks
-
-```
 benchmarks/
-  benchmark_mlx.py               -- Synthetic Metal kernel speed
-  benchmark_mlx_longbench.py     -- LongBench-Lite (6 tasks)
-  benchmark_mlx_needle_heatmap.py -- Needle retrieval heatmap (depth x context)
-  benchmark_mlx_ablation.py      -- Component ablation study
-  benchmark_mlx_throughput.py    -- Kernel throughput measurement
-  benchmark_mlx_model.py         -- End-to-end model benchmark
-  baselines.py                   -- KIVI + H2O (PyTorch, for comparison context)
-  benchmark_foveated.py          -- PyTorch reference benchmark
+  benchmark_crossover.py  -- Kernel-only + end-to-end crossover measurement
+  benchmark_promotion_quality.py -- Passkey retrieval with promotion
+  benchmark_mlx_sustained.py -- Sustained accuracy over long generation
+  benchmark_mlx.py        -- Quality, latency, memory, bandwidth
+  + 5 more benchmark files
 ```
 
-### Tests (34 passing)
-
-```
-tests/
-  test_mlx_foveated.py     -- 26 MLX tests: cache, quantize, tiers, attend, promote
-  test_disk_archive.py      -- 8 tests: create, read, roundtrip, layer isolation
-  test_foveated.py          -- PyTorch reference tests
-  test_async_manager.py     -- Async tier manager tests
-  test_patch.py             -- SDPA interception tests
-  test_baselines.py         -- KIVI/H2O baseline tests
-  test_longbench_scoring.py -- 29 scoring function tests
-  test_backend_parity.py    -- Backend parity against golden fixtures
-  backend_fixtures.py       -- Fixture generation utilities
-```
-
-### Scripts
-
-```
-scripts/
-  run_mlx_benchmarks.sh    -- Run all MLX benchmarks
-  generate_charts.py       -- Paper figures from JSON results
-```
-
-## Results (Qwen2.5-0.5B-Instruct-bf16, 8GB Mac)
-
-| Metric | Result |
-|--------|--------|
-| LongBench-Lite | 9.7 avg (vs 9.8 standard) |
-| Needle retrieval | 36/36 (100%) |
-| PPL ratio (1K) | 0.998x |
-| PPL ratio (2K) | 0.993x |
-| PPL ratio (4K) | 1.003x |
-| Memory compression | 2.21x |
-| Kernel speed (4K, 7B shapes) | 1.49x |
-| Kernel speed (8K, 7B shapes) | 1.46x |
-| Kernel speed (32K, original) | 3.28x |
-| Ablation: asymmetric K/V | 130x error without it |
-
-## Kernel Latency (7B shapes: H_kv=4, H_q=16, D=128, single layer, 100 iters)
+## Kernel Performance (7B shapes, 100 iters, single layer)
 
 | Context | fp16 SDPA | Fused Kernel | Speedup |
 |---------|-----------|-------------|---------|
-| 1,024 | 7.5ms | 7.5ms | 1.0x |
-| 4,096 | 7.8ms | 7.7ms | 1.0x |
-| 16,384 | 9.4ms | 7.8ms | 1.2x |
-| 32,768 | 75.1ms | 8.4ms | **8.9x** |
-| 65,536 | 83.4ms | 16.1ms | **5.2x** |
-| 131,072 | 271.4ms | 26.7ms | **10.2x** |
+| 1K | 7.5ms | 7.5ms | 1.0x |
+| 4K | 7.8ms | 7.7ms | 1.0x |
+| 16K | 9.4ms | 7.8ms | 1.2x |
+| 32K | 75ms | 8.4ms | **8.9x** |
+| 64K | 83ms | 16ms | **5.2x** |
+| 128K | 271ms | 27ms | **10.2x** |
 
-**Crossover: ~16K tokens.** Below that, break-even. Above, fused dominates
-because Apple's SDPA reads full fp16 KV (bandwidth-bound) while the fused
-kernel reads INT8/INT4 (2-4x fewer bytes per token). Adaptive split_size
-keeps num_splits ≤ 16 to avoid reduce kernel bottleneck at long contexts.
+Crossover at ~16K tokens. The fused kernel reads INT8/INT4 quantized data
+directly from memory while Apple's SDPA reads full fp16. At 32K+ where
+decode is bandwidth-bound, the 2-4x byte reduction dominates.
 
-End-to-end decode with a real model adds ~100ms/step Python interceptor overhead
-(24 layers × Python function calls + input validation). A C++ extension would
-eliminate this — blocked on MLX not shipping nanobind type caster headers.
+## Quality
 
-## Promotion Override Buffer
+| Metric | Result |
+|--------|--------|
+| Cosine similarity vs fp16 | 0.996+ at all contexts |
+| Memory compression | 2.13-2.34x |
+| PPL ratio (1K-4K) | 0.993-1.003x |
+| Needle retrieval | 36/36 (100%) |
+| LongBench-Lite | 9.7 avg (vs 9.8 standard) |
 
-The async promotion system uses a shared-memory override buffer:
-- Background worker writes promoted fp16 K,V into double-buffered numpy arrays
-- Metal kernel reads overrides via a pre-sorted merge-scan (O(N_FAR + MAX_OV))
-- Spike detection is a free byproduct of the kernel's online softmax
-- All 24 layers' spikes batched into one mx.eval per decode step
+## Key Design Decisions
 
-## Recency-Based Compression
+**Merged kernel**: Split-K + Reduce combined into a single dispatch via
+threadgroup shared memory. Multiple SIMD groups per threadgroup, each
+processes a token range, barrier, first SIMD group reduces. Eliminates
+global partial arrays and the second kernel dispatch.
 
-Tier assignment uses pure position (no scoring):
-- Sinks (first N) + recent window (last N) → foveal (fp16)
-- Next most recent middle → peripheral (INT8)
-- Oldest middle → far (INT8 K + INT4 V)
-- Deterministic — no argpartition non-determinism
+**Adaptive split_size**: Grows with context to cap num_splits ≤ 16,
+avoiding reduce bottleneck at long contexts while maintaining GPU
+occupancy at short contexts.
 
-Promotion via override buffer handles any important early tokens that
-land in the far tier.
+**Packed inputs**: Scale+zero pairs concatenated during compression
+(once, not per call). 19 inputs via Python path, 9 via C++ blob path.
 
-## What Is Planned
+**Override buffer**: Double-buffered numpy arrays in unified memory.
+CPU worker does sorted insert + atomic swap. Metal kernel merge-scans
+with a running pointer — O(N_FAR + MAX_OV) per layer, zero GPU sorting.
 
-- C++ MLX extension to eliminate Python interceptor overhead (~100ms/step)
-- Scale to larger models (7B+) on higher-end Apple Silicon
-- Formal paper write-up
+**Kernel-side spike detection**: Free byproduct of the fused kernel's
+online softmax (tracks max_far_score vs min_fov_score). All 24 layers'
+spikes batched into one mx.eval after logits eval.
 
-## Kernel Precision Fix
+**Recency-based compression**: Pure positional tier assignment — sinks +
+recent window → foveal, remaining by recency. Deterministic, fast.
+Promotion via override buffer handles important early tokens.
 
-The Metal Split-K kernel now produces byte-identical output to the reference
-dequant+SDPA path. The fix: `to_fp16()` rounding on dequantized K,V values
-in the kernel, matching the reference path's fp16 precision exactly.
+**C++ extension**: nanobind 2.10.2 (pinned to match MLX ABI). FoveatedHandle
+pre-packs 11 static arrays into a single uint8 blob. Merged kernel with
+9 inputs per dispatch. Eliminates Python dispatch overhead.
 
-Without this, float32 dequant introduced ~1 ULP fp16 differences per layer
-that compounded through 24-layer autoregressive decoding (0.999999 cosine
-per layer × 24 layers × multiple steps → generation divergence after 5 tokens).
+## End-to-End Status
 
-The kernel still uses float32 for all accumulation (online softmax, V weighting)
-for numerical stability. Only the dequantized input values are rounded to fp16.
+Kernel-only: at parity with Apple's SDPA at short context, 10x faster
+at 128K. End-to-end on 0.5B model: ~4.4x overhead from MLX's CustomKernel
+evaluator (internal to libmlx.dylib). The kernel compute is fast — the
+overhead is per-node graph evaluation cost for custom vs built-in primitives.
+
+At 32K+ context, the kernel speedup (10x) overcomes the evaluator overhead
+for a significant net win. The 0.5B model at short context is the worst
+case (weight-bound, KV cache is small, evaluator overhead dominates).
+
+## Tests
+
+63 passing (26 MLX foveated + 8 disk archive + 29 scoring)
+
+## What's Next
+
+- Demonstrate on larger models (7B+) at 32K+ context where the kernel
+  speedup delivers end-to-end gains
+- Explore MLX evaluator optimizations for custom kernel nodes
+- Formal write-up of the architecture and benchmark results

@@ -62,16 +62,16 @@ Rebuilt the entire system natively on MLX with custom Metal GPU kernels.
 
 8. **Full benchmark suite**: LongBench-Lite, needle heatmap, ablation, throughput.
 
-## Phase 3: Validation (Current)
+## Phase 3: Optimization (Current)
 
-Results on Qwen2.5-0.5B-Instruct-bf16, 8GB Mac:
+Results on 8GB Mac (kernel-only, 7B shapes, 100 iters):
 
-- LongBench-Lite: within 0.1 points of standard (9.7 vs 9.8 avg)
-- Needle retrieval: 36/36 (100%) across 2K-8K
-- PPL: non-accumulating (0.998x at 1K, 0.993x at 2K, 1.003x at 4K)
-- Memory: 2.21x compression
-- Kernel speed: 1.49x at 4K, 1.46x at 8K (7B shapes, synthetic)
-- 34 tests passing (26 MLX + 8 disk archive)
+- Kernel: 1.0x at 4K, 8.9x at 32K, 10.2x at 128K vs Apple SDPA
+- Quality: 0.996+ cosine, 2.13-2.34x compression, PPL ratio 0.993-1.003x
+- C++ extension: nanobind FoveatedHandle with blob-packed statics (9 inputs)
+- Merged kernel: Split-K + Reduce in single dispatch via shared memory
+- Override buffer: double-buffered, sorted insert, kernel-side spike detection
+- 63 tests passing
 
 ## What the PyTorch Code Still Does
 

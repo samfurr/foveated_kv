@@ -634,6 +634,81 @@ static const MergedCache& get_merged(const Config& cfg, int num_splits) {
     return _merged_cache[key];
 }
 
+// Align to 16 bytes
+static size_t align16(size_t x) { return (x + 15) & ~(size_t)15; }
+
+// Merged kernel with blob input — 11 statics packed into one buffer
+static const MergedCache& get_merged_blob(
+    const Config& cfg, int num_splits, const FoveatedHandle::BlobLayout& lay) {
+
+    // Include layout in cache key (offsets change with tier sizes)
+    auto key = merged_cache_key(cfg, num_splits) + "_blob";
+    auto it = _merged_cache.find(key);
+    if (it != _merged_cache.end()) return it->second;
+
+    int cpt = cfg.head_dim / 32;
+    std::ostringstream h;
+    h << "#include <metal_stdlib>\nusing namespace metal;\n\n"
+      << "constant uint N_FOV = " << cfg.n_fov << ";\n"
+      << "constant uint N_PER = " << cfg.n_per << ";\n"
+      << "constant uint N_FAR = " << cfg.n_far << ";\n"
+      << "constant uint HEAD_DIM = " << cfg.head_dim << ";\n"
+      << "constant uint HEAD_DIM_HALF = " << cfg.head_dim / 2 << ";\n"
+      << "constant uint H_Q = " << cfg.h_q << ";\n"
+      << "constant uint H_KV = " << cfg.h_kv << ";\n"
+      << "constant uint GQA_RATIO = " << cfg.h_q / cfg.h_kv << ";\n"
+      << "constant uint CPT = " << cpt << ";\n"
+      << "constant float INV_SQRT_D = " << 1.0 / std::sqrt((double)cfg.head_dim) << "f;\n"
+      << "constant float SPIKE_MARGIN = " << cfg.spike_margin << "f;\n"
+      << "constant uint MAX_OV = " << cfg.max_ov << ";\n"
+      << "constant uint SPLIT_SIZE = " << cfg.split_size << ";\n"
+      << "constant uint NUM_SPLITS = " << num_splits << ";\n\n"
+      << "inline float to_fp16(float x) { return (float)((half)x); }\n\n"
+      // Blob byte offsets as compile-time constants
+      << "constant uint BLOB_FOVEAL_K = " << lay.foveal_k << ";\n"
+      << "constant uint BLOB_FOVEAL_V = " << lay.foveal_v << ";\n"
+      << "constant uint BLOB_PERIPH_K = " << lay.periph_k << ";\n"
+      << "constant uint BLOB_PERIPH_V = " << lay.periph_v << ";\n"
+      << "constant uint BLOB_PERIPH_K_SZ = " << lay.periph_k_sz << ";\n"
+      << "constant uint BLOB_PERIPH_V_SZ = " << lay.periph_v_sz << ";\n"
+      << "constant uint BLOB_FAR_K = " << lay.far_k << ";\n"
+      << "constant uint BLOB_FAR_V = " << lay.far_v << ";\n"
+      << "constant uint BLOB_FAR_K_SZ = " << lay.far_k_sz << ";\n"
+      << "constant uint BLOB_FAR_V_SZ = " << lay.far_v_sz << ";\n"
+      << "constant uint BLOB_FOVEAL_VALID = " << lay.foveal_valid << ";\n";
+
+    // Blob unpacking: cast from uint8* to typed pointers at known offsets
+    std::string blob_unpack = R"METAL(
+    // Unpack typed pointers from blob at compile-time offsets
+    auto foveal_k = (const device half*)(blob + BLOB_FOVEAL_K);
+    auto foveal_v = (const device half*)(blob + BLOB_FOVEAL_V);
+    auto periph_k = (const device uint8_t*)(blob + BLOB_PERIPH_K);
+    auto periph_v = (const device uint8_t*)(blob + BLOB_PERIPH_V);
+    auto periph_k_sz = (const device half*)(blob + BLOB_PERIPH_K_SZ);
+    auto periph_v_sz = (const device half*)(blob + BLOB_PERIPH_V_SZ);
+    auto far_k = (const device uint8_t*)(blob + BLOB_FAR_K);
+    auto far_v = (const device uint8_t*)(blob + BLOB_FAR_V);
+    auto far_k_sz = (const device half*)(blob + BLOB_FAR_K_SZ);
+    auto far_v_sz = (const device half*)(blob + BLOB_FAR_V_SZ);
+    auto foveal_valid = (const device uint32_t*)(blob + BLOB_FOVEAL_VALID);
+)METAL";
+
+    std::string source = blob_unpack +
+        std::string(MERGED_SETUP) + TIER_PROCESSING + MERGED_REDUCE;
+    std::string name = "fov_merged_blob_" + key;
+
+    auto fn = fast::metal_kernel(
+        name,
+        {"rt_params", "query", "blob",
+         "decode_k", "decode_v",
+         "override_k", "override_v", "override_far_idx", "override_count"},
+        {"out", "spike_flags", "spike_tokens"},
+        source, h.str(), /*ensure_row_contiguous=*/true);
+
+    _merged_cache[key] = {std::move(fn)};
+    return _merged_cache[key];
+}
+
 FoveatedHandle::FoveatedHandle(
     const array& foveal_k, const array& foveal_v,
     const array& periph_k, const array& periph_v,
@@ -644,32 +719,71 @@ FoveatedHandle::FoveatedHandle(
     const array& far_v_scale, const array& far_v_zero,
     const array& foveal_valid,
     float spike_margin, int max_ov)
-    : foveal_k_(foveal_k), foveal_v_(foveal_v),
-      periph_k_(periph_k), periph_v_(periph_v),
-      // Pre-pack scale+zero pairs (ONCE, not per call)
-      periph_k_scale_(concatenate({periph_k_scale, periph_k_zero}, 0)),
-      periph_k_zero_(periph_k_zero), // kept for compatibility but unused
-      pv_s_(concatenate({
-          reshape(periph_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)}),
-          reshape(periph_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)})
-      }, 1)),
-      pv_z_(pv_s_), // unused, shares ref
-      far_k_(far_k), far_v_(far_v),
-      far_k_scale_(concatenate({far_k_scale, far_k_zero}, 0)),
-      far_k_zero_(far_k_zero), // unused
-      fv_s_(concatenate({
-          reshape(far_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)}),
-          reshape(far_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)})
-      }, 1)),
-      fv_z_(fv_s_), // unused
-      fov_valid_u32_(astype(foveal_valid, uint32)),
+    : blob_(array({1}, uint8)),  // placeholder, built below
       B_(foveal_k.shape(0)), H_kv_(foveal_k.shape(1)), D_(foveal_k.shape(3)),
       N_fov_(foveal_k.shape(2)), N_per_(periph_k.shape(2)), N_far_(far_k.shape(2)),
       N_static_(foveal_k.shape(2) + periph_k.shape(2) + far_k.shape(2)),
       spike_margin_(spike_margin), max_ov_(max_ov)
 {
-    // Materialize packed arrays
-    eval({periph_k_scale_, pv_s_, far_k_scale_, fv_s_});
+    int B = B_, H = H_kv_, D = D_;
+
+    // Pre-pack scale+zero pairs
+    auto periph_k_sz = concatenate({periph_k_scale, periph_k_zero}, 0);
+    auto pv_s = reshape(periph_v_scale, {B, H, std::max(N_per_, 0)});
+    auto pv_z = reshape(periph_v_zero, {B, H, std::max(N_per_, 0)});
+    auto periph_v_sz = concatenate({pv_s, pv_z}, 1);
+    auto far_k_sz = concatenate({far_k_scale, far_k_zero}, 0);
+    auto fv_s = reshape(far_v_scale, {B, H, std::max(N_far_, 0)});
+    auto fv_z = reshape(far_v_zero, {B, H, std::max(N_far_, 0)});
+    auto far_v_sz = concatenate({fv_s, fv_z}, 1);
+    auto fov_valid = astype(foveal_valid, uint32);
+
+    // Materialize all arrays so we can copy their data
+    eval({foveal_k, foveal_v, periph_k, periph_v,
+          periph_k_sz, periph_v_sz, far_k, far_v,
+          far_k_sz, far_v_sz, fov_valid});
+
+    // Compute blob layout with 16-byte alignment
+    layout_ = {};
+    size_t off = 0;
+    auto place = [&](size_t bytes) -> size_t {
+        size_t pos = off;
+        off = align16(off + bytes);
+        return pos;
+    };
+
+    layout_.foveal_k = place(foveal_k.nbytes());
+    layout_.foveal_v = place(foveal_v.nbytes());
+    layout_.periph_k = place(periph_k.nbytes());
+    layout_.periph_v = place(periph_v.nbytes());
+    layout_.periph_k_sz = place(periph_k_sz.nbytes());
+    layout_.periph_v_sz = place(periph_v_sz.nbytes());
+    layout_.far_k = place(far_k.nbytes());
+    layout_.far_v = place(far_v.nbytes());
+    layout_.far_k_sz = place(far_k_sz.nbytes());
+    layout_.far_v_sz = place(far_v_sz.nbytes());
+    layout_.foveal_valid = place(fov_valid.nbytes());
+    layout_.total = off;
+
+    // Allocate blob and copy data
+    blob_ = zeros({(int)layout_.total}, uint8);
+    eval(blob_);
+
+    auto* dst = blob_.data<uint8_t>();
+    auto copy_in = [&](size_t offset, const array& src) {
+        std::memcpy(dst + offset, src.data<uint8_t>(), src.nbytes());
+    };
+    copy_in(layout_.foveal_k, foveal_k);
+    copy_in(layout_.foveal_v, foveal_v);
+    copy_in(layout_.periph_k, periph_k);
+    copy_in(layout_.periph_v, periph_v);
+    copy_in(layout_.periph_k_sz, periph_k_sz);
+    copy_in(layout_.periph_v_sz, periph_v_sz);
+    copy_in(layout_.far_k, far_k);
+    copy_in(layout_.far_v, far_v);
+    copy_in(layout_.far_k_sz, far_k_sz);
+    copy_in(layout_.far_v_sz, far_v_sz);
+    copy_in(layout_.foveal_valid, fov_valid);
 }
 
 std::vector<array> FoveatedHandle::operator()(
@@ -691,20 +805,15 @@ std::vector<array> FoveatedHandle::operator()(
     cfg.split_size = split_size; cfg.max_ov = max_ov_;
     cfg.spike_margin = spike_margin_;
 
-    const auto& merged = get_merged(cfg, num_splits);
+    const auto& merged = get_merged_blob(cfg, num_splits, layout_);
 
     auto q_flat = reshape(query, {total_bh_q, D_});
     auto rt = array({(uint32_t)total_bh_q, (uint32_t)n_decode}, uint32);
 
-    // 19 inputs: rt + query + 11 pre-packed statics + 6 dynamic
+    // 9 inputs: rt + query + 1 blob + 6 dynamic
     std::vector<array> inputs = {
         rt, q_flat,
-        foveal_k_, foveal_v_,
-        periph_k_, periph_v_,
-        periph_k_scale_, pv_s_,   // packed scale+zero
-        far_k_, far_v_,
-        far_k_scale_, fv_s_,      // packed scale+zero
-        fov_valid_u32_,
+        blob_,
         decode_k, decode_v,
         override_k, override_v, override_far_idx, override_count
     };

@@ -84,16 +84,20 @@ class FoveatedHandle {
         const mlx::core::array& override_far_idx,
         const mlx::core::array& override_count);
 
+ public:
+    struct BlobLayout {
+        size_t foveal_k, foveal_v;           // fp16
+        size_t periph_k, periph_v;           // uint8
+        size_t periph_k_sz, periph_v_sz;     // fp16 (scale+zero packed)
+        size_t far_k, far_v;                 // uint8
+        size_t far_k_sz, far_v_sz;           // fp16 (scale+zero packed)
+        size_t foveal_valid;                 // uint32
+        size_t total;
+    };
+
  private:
-    // Pre-stored and pre-reshaped static arrays
-    mlx::core::array foveal_k_, foveal_v_;
-    mlx::core::array periph_k_, periph_v_;
-    mlx::core::array periph_k_scale_, periph_k_zero_;
-    mlx::core::array pv_s_, pv_z_;  // pre-reshaped
-    mlx::core::array far_k_, far_v_;
-    mlx::core::array far_k_scale_, far_k_zero_;
-    mlx::core::array fv_s_, fv_z_;  // pre-reshaped
-    mlx::core::array fov_valid_u32_;
+    mlx::core::array blob_;
+    BlobLayout layout_;
 
     int B_, H_kv_, D_, N_fov_, N_per_, N_far_, N_static_;
     float spike_margin_;

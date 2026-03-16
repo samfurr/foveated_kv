@@ -398,14 +398,10 @@ class MLXFoveatedLayer:
     def add_token(self, new_k: mx.array, new_v: mx.array) -> None:
         """Add a newly generated token to the decode buffer.
 
-        O(1) — just appends to a Python list. The actual concatenation
-        happens lazily in _effective_foveal_k/v when the kernel needs it.
-
         Args:
             new_k: (B, H, 1, D) float16
             new_v: (B, H, 1, D) float16
         """
-        # O(1) append to decode buffer. Foveal stays fixed (compile-time N_FOV).
         self._decode_k_buf.append(new_k)
         self._decode_v_buf.append(new_v)
         self._next_pos += 1

@@ -187,29 +187,9 @@ class MLXFoveatedLayer:
         if self._kcache is not None:
             return
 
-        # Try C++ fast path first
-        if _cpp_ext_available:
-            from .metal_foveated import MAX_OV
-            self._kcache = {
-                'cpp_handle': _FoveatedHandle(
-                    self.foveal_k, self.foveal_v,
-                    self.periph_k, self.periph_v,
-                    self.periph_k_scale, self.periph_k_zero,
-                    self.periph_v_scale, self.periph_v_zero,
-                    self.far_k, self.far_v,
-                    self.far_k_scale, self.far_k_zero,
-                    self.far_v_scale, self.far_v_zero,
-                    self.foveal_valid,
-                    spike_margin=0.5,
-                    max_ov=MAX_OV,
-                ),
-                'B': self.foveal_k.shape[0],
-                'H_kv': self.foveal_k.shape[1],
-                'D': self.foveal_k.shape[-1],
-            }
-            return
-
-        from .metal_foveated import _get_splitk_kernels, optimal_split_size, MAX_OV
+        # Always use Python merged kernel path (packed statics, single dispatch).
+        # The C++ FoveatedHandle uses unpacked 23-input two-pass which is slower.
+        from .metal_foveated import optimal_split_size, MAX_OV
 
         B = self.foveal_k.shape[0]
         H_kv = self.foveal_k.shape[1]
@@ -226,8 +206,7 @@ class MLXFoveatedLayer:
         fv_z = self.far_v_zero.reshape(B, H_kv, max(N_far, 0))
         fov_valid_u32 = self.foveal_valid.astype(mx.uint32)
 
-        # Static input list (positions 1-15 in the kernel's input order)
-        # Position 0 = rt_params (dynamic), these start at "query" slot
+        # Static input list for split-K fallback (unpacked, 15 arrays)
         static = [
             self.foveal_k, self.foveal_v,
             self.periph_k, self.periph_v,
@@ -236,6 +215,23 @@ class MLXFoveatedLayer:
             self.far_k_scale, self.far_k_zero, fv_s, fv_z,
             fov_valid_u32,
         ]
+
+        # Pre-packed scale+zero pairs for merged kernel (ONCE, not per call).
+        # Only pack scale+zero (same shape). K/V stay separate (different strides).
+        periph_k_sz = mx.concatenate([self.periph_k_scale, self.periph_k_zero], axis=0)
+        periph_v_sz = mx.concatenate([pv_s, pv_z], axis=1)
+        far_k_sz = mx.concatenate([self.far_k_scale, self.far_k_zero], axis=0)
+        far_v_sz = mx.concatenate([fv_s, fv_z], axis=1)
+
+        packed_static = [
+            self.foveal_k, self.foveal_v,       # 0,1
+            self.periph_k, self.periph_v,       # 2,3
+            periph_k_sz, periph_v_sz,           # 4,5 (packed scale+zero)
+            self.far_k, self.far_v,             # 6,7
+            far_k_sz, far_v_sz,                 # 8,9 (packed scale+zero)
+            fov_valid_u32,                      # 10
+        ]
+        mx.eval(periph_k_sz, periph_v_sz, far_k_sz, far_v_sz)
 
         # Pre-build zero override + empty decode arrays
         zero_ov_k = mx.zeros((H_kv, MAX_OV, D), dtype=mx.float16)
@@ -248,11 +244,12 @@ class MLXFoveatedLayer:
         self._kcache = {
             'B': B, 'H_kv': H_kv, 'D': D,
             'N_fov': N_fov, 'N_per': N_per, 'N_far': N_far,
-            'N_static': N_fov + N_per + N_far,  # for adaptive split_size
+            'N_static': N_fov + N_per + N_far,
             'static': static,
+            'packed_static': packed_static,
             'zero_ov': (zero_ov_k, zero_ov_v, zero_ov_idx, zero_ov_cnt),
             'empty_decode': (empty_dk, empty_dv),
-            'kernels': {},  # keyed by H_q (GQA ratio might vary)
+            'kernels': {},
         }
 
     def _dispatch_kernel(self, query: mx.array):
@@ -298,8 +295,8 @@ class MLXFoveatedLayer:
 
             return c['cpp_handle'](query, dk, dv, ov_k, ov_v, ov_idx, ov_cnt)
 
-        # --- Python fallback ---
-        from .metal_foveated import _get_splitk_kernels, optimal_split_size
+        # --- Python fallback: use pre-packed merged kernel ---
+        from .metal_foveated import _get_merged_kernel, optimal_split_size, _MAX_SPLITS
 
         B, H_kv, D = c['B'], c['H_kv'], c['D']
         N_fov, N_per, N_far = c['N_fov'], c['N_per'], c['N_far']
@@ -309,20 +306,25 @@ class MLXFoveatedLayer:
         dk = self.decode_k
         n_dec = dk.shape[2] if dk is not None else 0
         split_size = optimal_split_size(c['N_static'] + n_dec)
+        S_total = c['N_static'] + n_dec
+        num_splits = (S_total + split_size - 1) // split_size
 
-        kernel_key = (H_q, split_size)
+        # Get/cache merged kernel
+        kernel_key = (H_q, split_size, num_splits)
         if kernel_key not in c['kernels']:
-            c['kernels'][kernel_key] = _get_splitk_kernels(
-                N_fov, N_per, N_far, D, H_q, H_kv, 0.5, split_size,
+            c['kernels'][kernel_key] = _get_merged_kernel(
+                N_fov, N_per, N_far, D, H_q, H_kv, 0.5, split_size, num_splits,
             )
-        sk_kernel, red_kernel = c['kernels'][kernel_key]
+        merged = c['kernels'][kernel_key]
 
         q_flat = query.reshape(total_bh_q, D)
+
+        # Dynamic decode + overrides (K/V separate, no concat needed)
+        dk = self.decode_k
         if dk is None:
             dk, dv = c['empty_decode']
         else:
             dv = self.decode_v
-        n_decode = dk.shape[2] if dk is not None else 0
 
         if self.overrides is not None:
             ov = self.overrides
@@ -337,33 +339,21 @@ class MLXFoveatedLayer:
         else:
             ov_k, ov_v, ov_idx, ov_cnt = c['zero_ov']
 
-        S_total = N_fov + N_per + N_far + n_decode
-        num_splits = (S_total + split_size - 1) // split_size
-        partial_size = num_splits * total_bh_q
+        # Build input list: rt_params + query + 11 pre-packed statics + 6 dynamic
+        packed_inputs = [
+            mx.array([total_bh_q, n_dec], dtype=mx.uint32),
+            q_flat,
+        ] + c['packed_static'] + [
+            dk, dv, ov_k, ov_v, ov_idx, ov_cnt,
+        ]
 
-        sk_rt = mx.array([total_bh_q, n_decode], dtype=mx.uint32)
-        partials = sk_kernel(
-            inputs=[sk_rt, q_flat] + c['static'] + [dk, dv, ov_k, ov_v, ov_idx, ov_cnt],
-            output_shapes=[
-                (partial_size, D), (partial_size,), (partial_size,),
-                (partial_size,), (partial_size,), (partial_size,),
-            ],
-            output_dtypes=[mx.float32, mx.float32, mx.float32,
-                           mx.float32, mx.float32, mx.int32],
-            grid=(num_splits * total_bh_q * 32, 1, 1),
-            threadgroup=(32, 1, 1),
-            init_value=0.0,
-        )
-
-        red_rt = mx.array([num_splits, total_bh_q], dtype=mx.uint32)
-        outputs = red_kernel(
-            inputs=[red_rt] + list(partials),
+        outputs = merged(
+            inputs=packed_inputs,
             output_shapes=[(total_bh_q, D), (total_bh_q,), (total_bh_q,)],
             output_dtypes=[mx.float16, mx.int32, mx.int32],
-            grid=(total_bh_q * 32, 1, 1),
-            threadgroup=(32, 1, 1),
+            grid=(total_bh_q * num_splits * 32, 1, 1),
+            threadgroup=(num_splits * 32, 1, 1),
         )
-
         return (
             outputs[0].reshape(B, H_q, 1, D),
             outputs[1].reshape(B, H_q),

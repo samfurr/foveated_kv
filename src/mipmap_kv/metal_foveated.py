@@ -392,21 +392,12 @@ _MERGED_SOURCE = (
     uint dec_start = (gstart > nfpf) ? min(gstart - nfpf, N_DECODE) : 0u;
     uint dec_end   = (gend   > nfpf) ? min(gend   - nfpf, N_DECODE) : 0u;
 
-    // Unpack KV pointers from concatenated buffers.
-    // Use auto to handle constant vs device address space (MLX assigns
-    // small inputs to constant, large to device — we can't predict which).
-    auto foveal_k = foveal_kv;
-    auto foveal_v = foveal_kv + H_KV * N_FOV * HEAD_DIM;
-    auto periph_k = periph_kv;
-    auto periph_v = periph_kv + H_KV * N_PER * HEAD_DIM;
+    // Unpack scale+zero from packed buffers. K/V are separate inputs.
+    // Use auto for address space compatibility (constant vs device).
     auto periph_v_scale = periph_v_sz;
     auto periph_v_zero  = periph_v_sz + H_KV * N_PER;
     auto far_v_scale = far_v_sz;
     auto far_v_zero  = far_v_sz + H_KV * N_FAR;
-    auto decode_k = decode_kv;
-    auto decode_v = decode_kv + H_KV * N_DECODE * HEAD_DIM;
-    auto override_k = override_kv;
-    auto override_v = override_kv + H_KV * MAX_OV * HEAD_DIM;
 """
     + _TIER_PROCESSING
     + """
@@ -593,19 +584,18 @@ def _build_merged_kernel(n_fov, n_per, n_far, head_dim, h_q, h_kv,
         input_names=[
             "rt_params",                    # 0: (2,) uint32
             "query",                        # 1: (BH_q, D) fp16
-            "foveal_kv",                    # 2: K+V concatenated on dim 2
-            "periph_kv",                    # 3: K+V concatenated
-            "periph_k_sz",                  # 4: scale+zero interleaved
-            "periph_v_sz",                  # 5: scale+zero interleaved
-            "far_k",                        # 6: (B,H,N,D) uint8
-            "far_v",                        # 7: (B,H,N,D/2) uint8 — different shape, can't pack
-            "far_k_sz",                     # 8: scale+zero interleaved
-            "far_v_sz",                     # 9: scale+zero interleaved
-            "foveal_valid",                 # 10: (H,) uint32
-            "decode_kv",                    # 11: K+V concatenated
-            "override_kv",                  # 12: K+V concatenated
-            "override_far_idx",             # 13: (H,M) int32
-            "override_count",               # 14: (H,) int32
+            "foveal_k", "foveal_v",         # 2,3: fp16
+            "periph_k", "periph_v",         # 4,5: uint8
+            "periph_k_sz",                  # 6: scale+zero packed
+            "periph_v_sz",                  # 7: scale+zero packed
+            "far_k", "far_v",              # 8,9: uint8
+            "far_k_sz",                     # 10: scale+zero packed
+            "far_v_sz",                     # 11: scale+zero packed
+            "foveal_valid",                 # 12: (H,) uint32
+            "decode_k", "decode_v",         # 13,14: fp16
+            "override_k", "override_v",     # 15,16: fp16
+            "override_far_idx",             # 17: (H,M) int32
+            "override_count",               # 18: (H,) int32
         ],
         output_names=["out", "spike_flags", "spike_tokens"],
         header=header, source=_MERGED_SOURCE, ensure_row_contiguous=False,
@@ -739,39 +729,28 @@ def _run_splitk(inputs, B, H_q, H_kv, D, N_fov, N_per, N_far,
             spike_margin, split_size, num_splits,
         )
 
-        # Pack inputs: 23 → 15 arrays (concat K+V pairs, interleave scale+zero)
+        # Pack scale+zero pairs only (K/V stay separate — different strides)
         # inputs = [q_flat, foveal_k, foveal_v, periph_k, periph_v,
         #           periph_k_scale, periph_k_zero, pv_s, pv_z,
         #           far_k, far_v, far_k_scale, far_k_zero, fv_s, fv_z,
         #           foveal_valid]
-        q_flat = inputs[0]
-        foveal_kv = mx.concatenate([inputs[1], inputs[2]], axis=2)      # K+V on token dim
-        periph_kv = mx.concatenate([inputs[3], inputs[4]], axis=2)
-        periph_k_sz = mx.concatenate([inputs[5], inputs[6]], axis=0)    # scale, zero on batch dim
-        periph_v_sz = mx.concatenate([inputs[7], inputs[8]], axis=1)    # scale, zero on token dim
-        # far_k and far_v have different D (D vs D/2), can't pack
+        periph_k_sz = mx.concatenate([inputs[5], inputs[6]], axis=0)
+        periph_v_sz = mx.concatenate([inputs[7], inputs[8]], axis=1)
         far_k_sz = mx.concatenate([inputs[11], inputs[12]], axis=0)
         far_v_sz = mx.concatenate([inputs[13], inputs[14]], axis=1)
-        foveal_valid = inputs[15]
-        decode_kv = mx.concatenate([decode_k, decode_v], axis=2)
-        override_kv = mx.concatenate([override_k, override_v], axis=1)  # on MAX_OV dim
 
         packed_inputs = [
             mx.array([total_bh_q, n_decode], dtype=mx.uint32),  # 0: rt_params
-            q_flat,                                               # 1: query
-            foveal_kv,                                            # 2: foveal K+V
-            periph_kv,                                            # 3: periph K+V
-            periph_k_sz,                                          # 4: periph K scale+zero
-            periph_v_sz,                                          # 5: periph V scale+zero
-            inputs[9],                                            # 6: far_k
-            inputs[10],                                           # 7: far_v
-            far_k_sz,                                             # 8: far K scale+zero
-            far_v_sz,                                             # 9: far V scale+zero
-            foveal_valid,                                         # 10: foveal_valid
-            decode_kv,                                            # 11: decode K+V
-            override_kv,                                          # 12: override K+V
-            override_far_idx,                                     # 13: override_far_idx
-            override_count,                                       # 14: override_count
+            inputs[0],                                            # 1: query
+            inputs[1], inputs[2],                                 # 2,3: foveal K, V
+            inputs[3], inputs[4],                                 # 4,5: periph K, V
+            periph_k_sz, periph_v_sz,                             # 6,7: packed scale+zero
+            inputs[9], inputs[10],                                # 8,9: far K, V
+            far_k_sz, far_v_sz,                                   # 10,11: packed scale+zero
+            inputs[15],                                           # 12: foveal_valid
+            decode_k, decode_v,                                   # 13,14: decode K, V
+            override_k, override_v,                               # 15,16: override K, V
+            override_far_idx, override_count,                     # 17,18: override idx, count
         ]
 
         outputs = merged(

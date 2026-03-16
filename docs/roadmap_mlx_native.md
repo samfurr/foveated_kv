@@ -1,391 +1,278 @@
-# Roadmap: Native MLX Integration
+# Roadmap: Eliminating the Dispatch Overhead
 
-## The Problem
+## No Fork Required
 
-The fused foveated kernel matches Apple's SDPA at the compute level and
-reads 2-4x fewer bytes from memory. But end-to-end decode on a real model
-is 4.4x slower because every attention layer goes through MLX's
-`CustomKernel::eval_gpu` — a generic dispatch path designed for arbitrary
-user kernels, not for a tight inner loop called 24 times per step.
+The original plan called for forking MLX to add foveated attention as a
+built-in primitive. Research into MLX's internals revealed that isn't
+necessary. The existing C++ extension mechanism provides everything we
+need — we were just using it wrong.
 
-Apple's `ScaledDotProductAttention` bypasses this entirely. It is a
-first-class primitive in MLX's evaluator: direct buffer binding, no
-contiguity loops, no source string caching, pre-compiled Metal pipeline
-from the built-in metallib. That is the performance we need to match.
+## What Went Wrong
 
-## What CustomKernel::eval_gpu Does (Per Call)
+Our C++ `FoveatedHandle` calls `mx.fast.metal_kernel()` internally.
+That function creates `CustomKernel` graph nodes regardless of whether
+it's called from Python or C++. Every `CustomKernel::eval_gpu` runs the
+generic dispatch path: source string comparison, contiguity loops, hash
+map lookups with mutex contention, `dispatch_threads`.
 
-From the MLX source (`mlx/backend/metal/custom_kernel.cpp`):
+The handle eliminated Python overhead but still created the same slow
+graph nodes. Moving from Python to C++ changed who builds the nodes, not
+what kind of nodes get built.
 
-1. **Output allocation or init_value fill.** Allocates Metal buffers for
-   each output via `allocator::malloc`. If `init_value` is set, fills
-   the buffer with that value (extra GPU dispatch). Our merged kernel
-   uses `std::nullopt` so this is just malloc × 3 outputs.
+## What We Should Do Instead
 
-2. **Contiguity check loop.** For each of N inputs: read the array's
-   `flags().row_contiguous`. If false and `ensure_row_contiguous` is
-   true, copy the entire array to a contiguous temporary. Even when all
-   inputs are contiguous (ours are), the loop runs and checks every flag.
+Subclass `mlx::core::Primitive` directly. The `eval_gpu` loads a
+precompiled `.metallib` from disk and dispatches via `CommandEncoder` —
+the exact same code path that `ScaledDotProductAttention` uses. No
+`CustomKernel` involved anywhere.
 
-3. **Library cache validation.** Hash map lookup by kernel name. If
-   found, compare the stored source string against the current source
-   string (character-by-character, ~10KB for our kernel). If different,
-   clear the cached library and recompile. This comparison happens every
-   single `eval_gpu` call.
+We already built `FoveatedPrimitive` and proved it produces correct
+output (cosine 1.0 vs the Python path). It was slower at the time
+because of per-call temporary allocation and a misunderstanding about
+Metal buffer access. Both issues are now solved.
 
-4. **Library + kernel retrieval.** `d.get_library(name, builder)` does
-   a hash map lookup. If cached, returns immediately (builder lambda not
-   called). Then `d.get_kernel(name, lib)` does another hash map lookup
-   for the compiled pipeline state.
+## The Three Fixes
 
-5. **Buffer binding loop.** For each input: `set_input_array(arr, idx)`
-   which extracts the Metal buffer pointer, registers the buffer for
-   dependency tracking (checks against `prev_outputs_` set for barrier
-   insertion), and calls Metal's `setBuffer`. If `shape_infos_` flags
-   are set for that input, also sends shape, strides, and ndim as
-   additional buffer arguments (up to 3 extra bindings per input).
+### 1. Precompiled Metallib (Eliminates Source Caching)
 
-6. **Output binding.** For each output: `set_output_array(out, idx)`.
+`CustomKernel::eval_gpu` compares the full kernel source string on
+every call (~10KB character comparison) and looks up the JIT-compiled
+library through a mutex-protected hash map.
 
-7. **Grid validation.** Checks threadgroup size against
-   `maxTotalThreadsPerThreadgroup`. Computes adjusted grid/group dims.
+The fix: compile the kernel to a `.metallib` at build time. Load it
+once via `d.get_library("foveated_attn", path_to_metallib)` — the
+path-based overload reads a binary file, no string comparison, no JIT.
+Cached after first load.
 
-8. **Dispatch.** `dispatch_threads(grid, group)` — note: `threads`,
-   not `threadgroups`. Metal adjusts the grid at dispatch time.
-
-9. **Temporary registration.** `add_temporaries(copies, stream_index)`
-   to track the lifetime of any contiguity copies.
-
-## What ScaledDotProductAttention::eval_gpu Does
-
-From `mlx/backend/metal/scaled_dot_product_attention.cpp`:
-
-1. **Smart contiguity check.** Checks only the specific stride pattern
-   needed (last dim == 1, batch/head contiguous). Does NOT iterate all
-   inputs generically. Copies only when truly needed. Can donate the
-   query buffer to the output (zero-copy when possible).
-
-2. **Kernel lookup.** Builds a short name string (e.g.,
-   `sdpa_vector_float16_128_128`), looks up from the pre-compiled
-   default metallib. No source string comparison. No JIT. The metallib
-   is loaded once at startup.
-
-3. **Direct buffer binding.** Hardcoded: `set_input_array(q, 0)`,
-   `set_input_array(k, 1)`, `set_input_array(v, 2)`,
-   `set_output_array(out, 3)`. Then `set_bytes` for scalar params
-   (scale, gqa_factor, strides). No loops, no shape_info checks.
-
-4. **Dispatch.** `dispatch_threadgroups(grid, group)` — note:
-   `threadgroups`, not `threads`. No runtime grid adjustment.
-
-5. **No library cache management.** The kernel comes from the metallib
-   which is immutable.
-
-## The Gap
-
-Per layer, the extra cost of `CustomKernel::eval_gpu` vs SDPA's direct
-path is approximately 4ms. Over 24 layers, that is ~100ms per decode
-step. On a 0.5B model where the entire step takes 30ms with standard
-SDPA, this 100ms dominates. On a 7B model at 32K context where the step
-might take 200-400ms, the 100ms is still significant but the kernel's
-bandwidth savings start to compete.
-
-The gap comes from:
-- Generic input validation loops vs hardcoded binding
-- Source string caching vs pre-compiled metallib
-- `dispatch_threads` vs `dispatch_threadgroups`
-- No buffer donation optimization
-- More Metal buffer arguments (9 in our blob path vs 4 for SDPA)
-
-None of these are individually catastrophic. Combined over 24 layers
-with per-call overhead, they add up.
-
-## The Plan: Fork MLX
-
-Fork MLX v0.31.1 (matching our installed version). Add `foveated_sdpa`
-as a first-class primitive alongside `scaled_dot_product_attention`.
-Pin the fork in our project so `uv sync` builds from source.
-
-### Phase 1: Minimal Primitive
-
-**New files:**
-
-```
-mlx/fast_primitives.h     — add FoveatedSDPA class declaration
-mlx/fast.h                — add foveated_sdpa() function declaration
-mlx/backend/metal/foveated_sdpa.cpp — eval_gpu implementation
-mlx/backend/metal/kernels/foveated_sdpa.metal — kernel source
-mlx/backend/metal/kernels/CMakeLists.txt — add to metallib build
-python/mlx/fast.cpp       — nanobind binding for foveated_sdpa()
+```cmake
+# In csrc/CMakeLists.txt — use MLX's build macro
+mlx_build_metallib(
+    TARGET foveated_metallib
+    TITLE foveated_attn
+    OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/foveated_attn.metal
+    INCLUDE_DIRS ${MLX_INCLUDE_DIRS}
+)
 ```
 
-**FoveatedSDPA primitive class:**
+The kernel source moves from Python string constants to a proper
+`.metal` file. Metal function constants replace the string-templated
+compile-time constants:
+
+```metal
+constant int HEAD_DIM [[function_constant(0)]];
+constant int NUM_SPLITS [[function_constant(1)]];
+// ... tier sizes passed as function constants at pipeline creation
+```
+
+This lets one `.metallib` serve all tier configurations. Pipeline
+specialization happens at `get_kernel` time via `MTLFCList`, same as
+SDPA.
+
+### 2. Static Buffer Bypass (Eliminates Input Validation)
+
+`CustomKernel::eval_gpu` iterates all inputs checking contiguity and
+binding buffers through `set_input_array` (which does dependency
+tracking against the command encoder's output set).
+
+The fix: the 11 static tier arrays never change after compression.
+Bind them via `set_buffer` using their raw `MTL::Buffer*` pointer,
+extracted once at construction:
 
 ```cpp
-class FoveatedSDPA : public Custom {
-public:
-    FoveatedSDPA(
-        Stream stream,
-        int n_fov, int n_per, int n_far,
-        int head_dim, int h_q, int h_kv,
-        int split_size, int num_splits, int max_ov,
-        float scale, float spike_margin);
+// In FoveatedPrimitive constructor (once):
+for (auto& arr : static_arrays) {
+    static_bufs_.push_back(static_cast<const MTL::Buffer*>(arr.buffer().ptr()));
+    static_offsets_.push_back(arr.offset());
+}
 
-    void eval_gpu(
-        const std::vector<array>& inputs,
-        std::vector<array>& outputs) override;
-
-private:
-    // Compile-time tier config (no runtime lookup needed)
-    int n_fov_, n_per_, n_far_;
-    int head_dim_, h_q_, h_kv_;
-    int split_size_, num_splits_, max_ov_;
-    float scale_, spike_margin_;
-};
+// In eval_gpu (every call):
+for (int i = 0; i < 11; i++)
+    enc.set_buffer(static_bufs_[i], buffer_idx + i, static_offsets_[i]);
 ```
 
-**eval_gpu implementation** (mirrors `sdpa_vector` pattern):
+Critical detail from the research: `buffer().ptr()` returns the
+`MTL::Buffer*`. Our earlier attempt used `buffer().raw_ptr()` which
+returns the data address — wrong level of indirection. This is confirmed
+in MLX's allocator source where the Metal buffer is obtained via
+`static_cast<MTL::Buffer*>(buffer.ptr())`.
+
+Only the 7 dynamic inputs (query, decode K/V, override arrays) go
+through `set_input_array` for proper dependency tracking. The statics
+have no dependencies — they were evaluated during compression and never
+change.
+
+Graph inputs drop from 19 (or 9 with blob) to 7. The evaluator only
+tracks 7 edges per node instead of 19.
+
+### 3. Merged Kernel + dispatch_threadgroups
+
+The merged kernel (Split-K + Reduce in one dispatch via shared memory)
+is already implemented and working. The `FoveatedPrimitive` uses
+`dispatch_threadgroups` directly — no runtime grid adjustment from
+`dispatch_threads`.
+
+Research confirmed that `dispatch_threads` vs `dispatch_threadgroups`
+has minimal overhead difference (sub-microsecond). But using
+`dispatch_threadgroups` matches the SDPA pattern exactly and avoids
+any potential Metal runtime adjustments.
+
+## Implementation
+
+### Files to Modify
+
+```
+csrc/
+  CMakeLists.txt              — add mlx_build_metallib, link metallib
+  foveated_attn.h             — update FoveatedPrimitive with static bufs
+  foveated_attn.cpp           — eval_gpu with precompiled lib + set_buffer
+  kernels/
+    foveated_attn.metal       — NEW: kernel source extracted from Python
+    foveated_attn.h           — NEW: shared constants/structs for Metal
+```
+
+### FoveatedPrimitive::eval_gpu (Target Implementation)
 
 ```cpp
-void FoveatedSDPA::eval_gpu(
+void FoveatedPrimitive::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs)
 {
     auto& s = stream();
     auto& d = metal::device(s.device);
-
-    // inputs: [query, foveal_k, foveal_v, periph_k, periph_v,
-    //          periph_k_sz, periph_v_sz, far_k, far_v,
-    //          far_k_sz, far_v_sz, foveal_valid,
-    //          decode_k, decode_v,
-    //          override_k, override_v, override_far_idx, override_count]
-    //
-    // OR: [query, blob, decode_k, decode_v,
-    //       override_k, override_v, override_far_idx, override_count]
-
-    auto& query = inputs[0];
-    auto& out = outputs[0];
-
-    // Donate query buffer to output if possible (like SDPA does)
-    if (query.is_donatable() && query.flags().row_contiguous
-        && query.size() == out.size()) {
-        out.copy_shared_buffer(query);
-    } else {
-        out.set_data(allocator::malloc(out.nbytes()));
-    }
-    outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
-    outputs[2].set_data(allocator::malloc(outputs[2].nbytes()));
-
-    // Build kernel name from compile-time config
-    std::string kname = "foveated_sdpa_";
-    kname += std::to_string(head_dim_);
-    kname += "_" + std::to_string(num_splits_);
-
-    // Get kernel from pre-compiled metallib (no JIT, no source caching)
     auto& enc = d.get_command_encoder(s.index);
-    auto kernel = d.get_kernel(kname);
+
+    // Allocate outputs (3 arrays: out, spike_flags, spike_tokens)
+    for (auto& o : outputs)
+        o.set_data(allocator::malloc(o.nbytes()));
+
+    // Precompiled kernel — loaded once from .metallib, cached by name
+    // Function constants specialize for HEAD_DIM, NUM_SPLITS, etc.
+    auto kernel = d.get_kernel(kernel_name_, metallib_, hash_name_, func_consts_);
     enc.set_compute_pipeline_state(kernel);
 
-    // Direct buffer binding — no loops, no shape_info
-    int idx = 0;
+    // Static tier arrays — raw Metal buffer binding, no graph tracking
+    for (int i = 0; i < n_static_; i++)
+        enc.set_buffer(static_bufs_[i], i, static_offsets_[i]);
+
+    // Dynamic inputs — standard set_input_array for dependency tracking
+    // inputs[0]: query, [1]: decode_k, [2]: decode_v,
+    // [3-6]: override arrays
+    int idx = n_static_;
     for (int i = 0; i < inputs.size(); i++)
         enc.set_input_array(inputs[i], idx++);
+
+    // Outputs
     for (auto& o : outputs)
         enc.set_output_array(o, idx++);
 
-    // Scalar params as raw bytes
-    int n_decode = inputs[/* decode_k idx */].shape(2);
-    int total_bh_q = query.shape(0);
+    // Runtime params as raw bytes (no mx.array allocation)
+    int n_decode = inputs[1].shape(2);
+    int total_bh_q = inputs[0].shape(0);
     uint32_t params[2] = {(uint32_t)total_bh_q, (uint32_t)n_decode};
-    enc.set_bytes(params, 2, idx++);
+    enc.set_bytes(params, 2, idx);
 
-    // dispatch_threadgroups (not dispatch_threads)
+    // Single dispatch — merged kernel, shared memory reduce
     enc.dispatch_threadgroups(
         MTL::Size(total_bh_q, 1, 1),
         MTL::Size(num_splits_ * 32, 1, 1));
 }
 ```
 
-**Metal kernel** (`foveated_sdpa.metal`):
+This is structurally identical to `sdpa_vector` in MLX's own source.
+Same `get_command_encoder`, same `set_compute_pipeline_state`, same
+`dispatch_threadgroups`. No contiguity loops, no source caching, no
+hash map mutex contention.
 
-Extract from our Python string constants into a proper `.metal` file.
-The kernel body is identical to `_MERGED_SOURCE` + `_TIER_PROCESSING`.
-Compile into the metallib at build time via `mlx_build_metallib` in
-CMakeLists.txt. Use Metal function constants for `NUM_SPLITS` and
-`HEAD_DIM` to specialize without separate source strings.
+### Python Integration
 
-```metal
-constant int NUM_SPLITS [[function_constant(0)]];
-constant int HEAD_DIM   [[function_constant(1)]];
-// ... other tier constants
-
-[[kernel]] void foveated_sdpa_128_3(
-    const device half* query [[buffer(0)]],
-    const device uint8_t* blob [[buffer(1)]],
-    // ... remaining inputs
-    device half* out [[buffer(N)]],
-    device int* spike_flags [[buffer(N+1)]],
-    device int* spike_tokens [[buffer(N+2)]],
-    uint3 tg_pos [[threadgroup_position_in_grid]],
-    uint3 thread_pos [[thread_position_in_threadgroup]]
-) {
-    // Identical to current merged kernel body
-}
-```
-
-**Python binding** (in `python/mlx/fast.cpp`):
-
-```cpp
-m.def(
-    "foveated_sdpa",
-    &fast::foveated_sdpa,
-    "query"_a, "blob"_a,
-    "decode_k"_a, "decode_v"_a,
-    "override_k"_a, "override_v"_a,
-    "override_far_idx"_a, "override_count"_a,
-    "n_fov"_a, "n_per"_a, "n_far"_a,
-    "head_dim"_a, "h_q"_a, "h_kv"_a,
-    "split_size"_a, "num_splits"_a, "max_ov"_a,
-    "scale"_a, "spike_margin"_a = 0.5f,
-    nb::kw_only(), "stream"_a = nb::none());
-```
-
-### Phase 2: Integration
-
-Replace the SDPA interceptor call with `mx.fast.foveated_sdpa()`.
-Since it is a real `mx.fast` function (not a CustomKernel), the model's
-forward pass creates `FoveatedSDPA` primitive nodes instead of
-`CustomKernel` nodes. The evaluator processes them through the fast
-path — no contiguity loops, no source caching, no `dispatch_threads`.
-
-The interceptor becomes:
+The `FoveatedHandleDirect` nanobind class creates `FoveatedPrimitive`
+graph nodes via `array::make_arrays`. The interceptor calls it:
 
 ```python
-def _fused_sdpa_interceptor(queries, keys, values, *, scale, **kwargs):
-    if queries.shape[2] > 1:
-        return _original_sdpa(queries, keys, values, scale=scale, **kwargs)
-    layer_idx = state.layer_counter; state.layer_counter += 1
-    fov_layer = state.fov_cache.layers[layer_idx]
-    return mx.fast.foveated_sdpa(
-        queries, fov_layer._blob,
-        fov_layer.decode_k, fov_layer.decode_v,
-        *fov_layer._override_arrays(),
-        n_fov=fov_layer.N_fov, ...)
+# In _fused_sdpa_interceptor:
+out, flags, tokens = handle(query, decode_k, decode_v,
+                            ov_k, ov_v, ov_idx, ov_cnt)
 ```
 
-One C++ function call per layer (same as standard SDPA), creating one
-graph node with the same evaluator privileges.
+One nanobind call per layer. The primitive's `eval_gpu` runs on the
+same path as SDPA. The evaluator processes `FoveatedPrimitive` nodes
+the same way it processes `ScaledDotProductAttention` nodes — through
+the generic `arr.primitive().eval_gpu()` virtual dispatch with no
+special-casing either way.
 
-### Phase 3: Pre-Compiled Metallib
-
-Move the kernel from JIT string to the pre-compiled metallib. Add to
-`mlx/backend/metal/kernels/CMakeLists.txt`:
+### Build System
 
 ```cmake
-build_kernel(foveated_sdpa foveated_sdpa.metal foveated_sdpa.h)
+# csrc/CMakeLists.txt
+
+# Find MLX
+find_package(MLX CONFIG REQUIRED)
+include(${MLX_CMAKE_DIR}/extension.cmake)
+
+# Compile Metal kernel to metallib
+mlx_build_metallib(
+    TARGET foveated_metallib
+    TITLE foveated_attn
+    OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/kernels/foveated_attn.metal
+    INCLUDE_DIRS ${MLX_INCLUDE_DIRS}
+)
+
+# C++ extension module
+find_package(nanobind CONFIG REQUIRED)
+nanobind_add_module(foveated_ext
+    NB_STATIC STABLE_ABI LTO NOMINSIZE
+    NB_DOMAIN mlx
+    bindings.cpp
+    foveated_attn.cpp
+)
+target_link_libraries(foveated_ext PRIVATE mlx)
+add_dependencies(foveated_ext foveated_metallib)
+
+# Install metallib alongside the extension
+install(FILES ${CMAKE_BINARY_DIR}/foveated_attn.metallib
+        DESTINATION ${CMAKE_INSTALL_PREFIX})
 ```
 
-Use Metal function constants for specialization:
+Build: `uv sync --extra ext && uv run python setup.py build_ext --inplace`
 
-```cmake
-# Generate variants for common HEAD_DIM values
-foreach(HD IN ITEMS 64 128)
-    foreach(NS IN ITEMS 1 2 3 4 8 16)
-        # Function constants set at pipeline creation
-    endforeach()
-endforeach()
-```
+The `.metallib` file is compiled once at build time. No JIT compilation
+at runtime. No source strings stored in memory.
 
-This eliminates ALL JIT compilation. The kernel is compiled once when
-MLX is built, loaded from the metallib at startup, and dispatched
-directly.
+## What This Eliminates
 
-### Phase 4: Buffer Donation
-
-Implement query buffer donation (like SDPA does):
-
-```cpp
-if (query.is_donatable() && query.flags().row_contiguous
-    && query.size() == out.size()) {
-    out.copy_shared_buffer(query);
-}
-```
-
-This eliminates one `malloc` per layer per step (the output allocation).
-With 24 layers, that is 24 fewer Metal buffer allocations per decode
-step.
-
-### Phase 5: Benchmark and Validate
-
-With the native primitive in place:
-
-1. Re-run the kernel benchmark at all context lengths. The SDPA cliff
-   at 32K becomes our baseline (we cannot control Apple's kernel), but
-   our kernel should now dispatch with the same per-layer overhead as
-   SDPA — any remaining gap is pure GPU compute difference.
-
-2. End-to-end decode on 0.5B, 3B, 7B models. Measure tok/s, not just
-   kernel ms. The 4.4x overhead should collapse to near 1.0x at short
-   context (same dispatch path), with bandwidth savings dominating at
-   long context.
-
-3. Memory comparison. At 32K+ context, show the KV cache size difference
-   (fp16 vs foveated) and demonstrate fitting a model that would
-   otherwise OOM.
-
-4. Quality. Re-run needle, LongBench, PPL at multiple context lengths
-   to confirm no regression from the native integration.
-
-## Build System
-
-Pin the MLX fork as a dependency:
-
-```toml
-# pyproject.toml
-[tool.uv.sources]
-mlx = { git = "https://github.com/your-username/mlx.git", branch = "foveated" }
-```
-
-Or for local development:
-
-```toml
-mlx = { path = "../mlx-fork" }
-```
-
-`uv sync` builds MLX from source with our additions. The C++ extension
-(`csrc/`) becomes unnecessary — the kernel dispatches through MLX's own
-evaluator.
+| CustomKernel overhead | FoveatedPrimitive |
+|-----------------------|-------------------|
+| 10KB source string comparison per call | None (precompiled metallib) |
+| Hash map lookup with shared_lock | Direct pointer to cached pipeline |
+| Contiguity check loop (N inputs) | Static bufs bypass graph; 7 dynamic only |
+| Shape/stride/ndim conditional binding | Not used (no shape_infos) |
+| dispatch_threads | dispatch_threadgroups |
+| Lambda construction for builder | None (path-based library load) |
+| checked_inputs vector allocation | No intermediate vector |
 
 ## Expected Outcome
 
-The native primitive eliminates the 100ms dispatch overhead. The
-end-to-end performance becomes:
+The per-layer dispatch overhead should drop from ~5ms (CustomKernel) to
+~1ms (matching SDPA). Over 24 layers, that is 96ms saved — bringing
+end-to-end decode from ~130ms to ~35ms on the 0.5B model.
 
-- **Short context (< 16K):** Near parity with standard SDPA. Same
-  dispatch path, same evaluator treatment. The fused kernel reads a few
-  more bytes (packed scale/zero arrays) but the compute is equivalent.
+At that point, the fused kernel adds approximately 5ms of total overhead
+over standard SDPA (from the 7 dynamic input bindings + runtime params).
+The remaining comparison is pure GPU compute: our merged kernel reading
+INT8/INT4 vs SDPA reading fp16. Break-even at short context, bandwidth
+wins at long context.
 
-- **Long context (> 16K):** Bandwidth savings from INT8/INT4 dominate.
-  The exact speedup depends on the model, context length, and hardware
-  — the SDPA cliff issue needs investigation on larger machines to
-  separate our savings from baseline degradation.
+## Phases
 
-- **Memory:** 2.2x compression at all context lengths, enabling longer
-  context or larger models on the same hardware.
+| Phase | What | Effort |
+|-------|------|--------|
+| 1 | Extract kernel to .metal file, compile with mlx_build_metallib | 0.5 day |
+| 2 | Update FoveatedPrimitive eval_gpu: load metallib, set_buffer for statics | 1 day |
+| 3 | Metal function constants for tier specialization | 0.5 day |
+| 4 | Benchmark: verify SDPA-equivalent dispatch overhead | 0.5 day |
+| 5 | End-to-end validation on 0.5B + larger models | 1 day |
 
-The overhead gap between our kernel and Apple's SDPA becomes a pure
-GPU compute comparison, not a dispatch path comparison. That is the
-honest benchmark we need.
-
-## Timeline Estimate
-
-| Phase | Effort | Description |
-|-------|--------|-------------|
-| 1 | 2-3 days | Minimal primitive + JIT kernel in fork |
-| 2 | 1 day | Python integration, replace interceptor |
-| 3 | 1-2 days | Pre-compiled metallib, function constants |
-| 4 | 0.5 day | Buffer donation |
-| 5 | 1-2 days | Full benchmark suite on larger hardware |
-
-Total: ~1 week of focused work, assuming familiarity with the MLX
-codebase (which we now have from reading the source).
+Total: ~3 days of focused work. No MLX fork. Same `csrc/` directory,
+same build system, same nanobind module.

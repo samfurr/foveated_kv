@@ -453,14 +453,185 @@ std::vector<array> foveated_attention(
 }
 
 // ---------------------------------------------------------------------------
-// FoveatedHandle: pre-bind static arrays, dispatch with dynamic only
+// FoveatedHandle: merged kernel with pre-packed statics, single dispatch
 // ---------------------------------------------------------------------------
 
 static int adaptive_split_size(int s_total) {
-    const int base = 256;
-    const int max_splits = 16;
+    const int base = 256, max_splits = 16;
     if (s_total <= base * max_splits) return base;
     return ((s_total + max_splits - 1) / max_splits + 255) / 256 * 256;
+}
+
+// Merged kernel source: multi-SIMD-group per threadgroup, shared memory reduce
+static const char* MERGED_SETUP = R"METAL(
+    uint TOTAL_BH_Q = rt_params[0];
+    uint N_DECODE    = rt_params[1];
+
+    uint bh_q      = threadgroup_position_in_grid.x;
+    uint simd_id   = thread_position_in_threadgroup.x / 32;
+    uint lane_id   = thread_position_in_threadgroup.x % 32;
+    uint split_id  = simd_id;
+
+    uint batch_idx = bh_q / H_Q;
+    uint q_head    = bh_q % H_Q;
+    uint kv_head   = q_head / GQA_RATIO;
+    uint bh_kv = batch_idx * H_KV + kv_head;
+
+    float q_reg[CPT];
+    for (uint c = 0; c < CPT; c++)
+        q_reg[c] = (float)query[bh_q * HEAD_DIM + lane_id * CPT + c];
+
+    uint sz_stride = H_KV * HEAD_DIM;
+    float pk_s[CPT], pk_z[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        uint d = lane_id * CPT + c;
+        uint base = bh_kv * HEAD_DIM + d;
+        pk_s[c] = (float)periph_k_sz[base];
+        pk_z[c] = (float)periph_k_sz[base + sz_stride];
+    }
+    float fk_s[CPT], fk_z[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        uint d = lane_id * CPT + c;
+        uint base = bh_kv * HEAD_DIM + d;
+        fk_s[c] = (float)far_k_sz[base];
+        fk_z[c] = (float)far_k_sz[base + sz_stride];
+    }
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[CPT];
+    for (uint c = 0; c < CPT; c++) acc[c] = 0.0f;
+    float min_fov_score = INFINITY, max_far_score = -INFINITY;
+    int max_far_token = -1;
+
+    uint S_total = N_FOV + N_PER + N_FAR + N_DECODE;
+    uint gstart  = split_id * SPLIT_SIZE;
+    uint gend    = min(gstart + SPLIT_SIZE, S_total);
+    uint fov_start = min(gstart, N_FOV);
+    uint fov_end   = min(gend,   N_FOV);
+    uint per_start = (gstart > N_FOV) ? min(gstart - N_FOV, N_PER) : 0u;
+    uint per_end   = (gend   > N_FOV) ? min(gend   - N_FOV, N_PER) : 0u;
+    uint nfp = N_FOV + N_PER;
+    uint far_start = (gstart > nfp) ? min(gstart - nfp, N_FAR) : 0u;
+    uint far_end   = (gend   > nfp) ? min(gend   - nfp, N_FAR) : 0u;
+    uint nfpf = nfp + N_FAR;
+    uint dec_start = (gstart > nfpf) ? min(gstart - nfpf, N_DECODE) : 0u;
+    uint dec_end   = (gend   > nfpf) ? min(gend   - nfpf, N_DECODE) : 0u;
+
+    auto periph_v_scale = periph_v_sz;
+    auto periph_v_zero  = periph_v_sz + H_KV * N_PER;
+    auto far_v_scale = far_v_sz;
+    auto far_v_zero  = far_v_sz + H_KV * N_FAR;
+)METAL";
+
+static const char* MERGED_REDUCE = R"METAL(
+    threadgroup float shared_acc[NUM_SPLITS * HEAD_DIM];
+    threadgroup float shared_l[NUM_SPLITS];
+    threadgroup float shared_m[NUM_SPLITS];
+    threadgroup float shared_min_fov[NUM_SPLITS];
+    threadgroup float shared_max_far[NUM_SPLITS];
+    threadgroup int   shared_far_tok[NUM_SPLITS];
+
+    for (uint c = 0; c < CPT; c++)
+        shared_acc[split_id * HEAD_DIM + lane_id * CPT + c] = acc[c];
+    if (lane_id == 0) {
+        shared_l[split_id]        = l;
+        shared_m[split_id]        = m;
+        shared_min_fov[split_id]  = min_fov_score;
+        shared_max_far[split_id]  = max_far_score;
+        shared_far_tok[split_id]  = max_far_token;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float m_global = -INFINITY, l_global = 0.0f;
+        float racc[CPT];
+        for (uint c = 0; c < CPT; c++) racc[c] = 0.0f;
+        float min_fov = INFINITY, max_far = -INFINITY;
+        int far_token = -1;
+        for (uint s = 0; s < NUM_SPLITS; s++) {
+            float m_s = shared_m[s];
+            if (m_s == -INFINITY) continue;
+            float l_s = shared_l[s];
+            float m_new = max(m_global, m_s);
+            float ag = (m_global > -INFINITY) ? exp(m_global - m_new) : 0.0f;
+            float as_val = exp(m_s - m_new);
+            l_global = ag * l_global + as_val * l_s;
+            for (uint c = 0; c < CPT; c++) {
+                float pv = shared_acc[s * HEAD_DIM + lane_id * CPT + c];
+                racc[c] = ag * racc[c] + as_val * pv;
+            }
+            m_global = m_new;
+            float mf = shared_min_fov[s]; min_fov = min(min_fov, mf);
+            float fs = shared_max_far[s];
+            if (fs > max_far) { max_far = fs; far_token = shared_far_tok[s]; }
+        }
+        float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+        for (uint c = 0; c < CPT; c++)
+            out[bh_q * HEAD_DIM + lane_id * CPT + c] = (half)(racc[c] * inv_l);
+        if (lane_id == 0) {
+            spike_flags[bh_q]  = (max_far > min_fov + SPIKE_MARGIN) ? 1 : 0;
+            spike_tokens[bh_q] = far_token;
+        }
+    }
+)METAL";
+
+// Merged kernel cache
+struct MergedCache {
+    fast::CustomKernelFunction fn;
+};
+static std::unordered_map<std::string, MergedCache> _merged_cache;
+
+static std::string merged_cache_key(const Config& cfg, int num_splits) {
+    std::ostringstream k;
+    k << cfg.n_fov << "_" << cfg.n_per << "_" << cfg.n_far << "_"
+      << cfg.head_dim << "_" << cfg.h_q << "_" << cfg.h_kv << "_"
+      << (int)(cfg.spike_margin * 1000) << "_" << cfg.split_size
+      << "_" << num_splits;
+    return k.str();
+}
+
+static const MergedCache& get_merged(const Config& cfg, int num_splits) {
+    auto key = merged_cache_key(cfg, num_splits);
+    auto it = _merged_cache.find(key);
+    if (it != _merged_cache.end()) return it->second;
+
+    // Build header with NUM_SPLITS constant
+    int cpt = cfg.head_dim / 32;
+    std::ostringstream h;
+    h << "#include <metal_stdlib>\nusing namespace metal;\n\n"
+      << "constant uint N_FOV = " << cfg.n_fov << ";\n"
+      << "constant uint N_PER = " << cfg.n_per << ";\n"
+      << "constant uint N_FAR = " << cfg.n_far << ";\n"
+      << "constant uint HEAD_DIM = " << cfg.head_dim << ";\n"
+      << "constant uint HEAD_DIM_HALF = " << cfg.head_dim / 2 << ";\n"
+      << "constant uint H_Q = " << cfg.h_q << ";\n"
+      << "constant uint H_KV = " << cfg.h_kv << ";\n"
+      << "constant uint GQA_RATIO = " << cfg.h_q / cfg.h_kv << ";\n"
+      << "constant uint CPT = " << cpt << ";\n"
+      << "constant float INV_SQRT_D = " << 1.0 / std::sqrt((double)cfg.head_dim) << "f;\n"
+      << "constant float SPIKE_MARGIN = " << cfg.spike_margin << "f;\n"
+      << "constant uint MAX_OV = " << cfg.max_ov << ";\n"
+      << "constant uint SPLIT_SIZE = " << cfg.split_size << ";\n"
+      << "constant uint NUM_SPLITS = " << num_splits << ";\n\n"
+      << "inline float to_fp16(float x) { return (float)((half)x); }\n";
+
+    std::string source = std::string(MERGED_SETUP) + TIER_PROCESSING + MERGED_REDUCE;
+    std::string name = "fov_merged_" + key;
+
+    auto fn = fast::metal_kernel(
+        name,
+        {"rt_params", "query",
+         "foveal_k", "foveal_v", "periph_k", "periph_v",
+         "periph_k_sz", "periph_v_sz",
+         "far_k", "far_v", "far_k_sz", "far_v_sz",
+         "foveal_valid",
+         "decode_k", "decode_v",
+         "override_k", "override_v", "override_far_idx", "override_count"},
+        {"out", "spike_flags", "spike_tokens"},
+        source, h.str(), /*ensure_row_contiguous=*/true);
+
+    _merged_cache[key] = {std::move(fn)};
+    return _merged_cache[key];
 }
 
 FoveatedHandle::FoveatedHandle(
@@ -475,19 +646,30 @@ FoveatedHandle::FoveatedHandle(
     float spike_margin, int max_ov)
     : foveal_k_(foveal_k), foveal_v_(foveal_v),
       periph_k_(periph_k), periph_v_(periph_v),
-      periph_k_scale_(periph_k_scale), periph_k_zero_(periph_k_zero),
-      pv_s_(reshape(periph_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)})),
-      pv_z_(reshape(periph_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)})),
+      // Pre-pack scale+zero pairs (ONCE, not per call)
+      periph_k_scale_(concatenate({periph_k_scale, periph_k_zero}, 0)),
+      periph_k_zero_(periph_k_zero), // kept for compatibility but unused
+      pv_s_(concatenate({
+          reshape(periph_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)}),
+          reshape(periph_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)periph_k.shape(2), 0)})
+      }, 1)),
+      pv_z_(pv_s_), // unused, shares ref
       far_k_(far_k), far_v_(far_v),
-      far_k_scale_(far_k_scale), far_k_zero_(far_k_zero),
-      fv_s_(reshape(far_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)})),
-      fv_z_(reshape(far_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)})),
+      far_k_scale_(concatenate({far_k_scale, far_k_zero}, 0)),
+      far_k_zero_(far_k_zero), // unused
+      fv_s_(concatenate({
+          reshape(far_v_scale, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)}),
+          reshape(far_v_zero, {foveal_k.shape(0), foveal_k.shape(1), std::max((int)far_k.shape(2), 0)})
+      }, 1)),
+      fv_z_(fv_s_), // unused
       fov_valid_u32_(astype(foveal_valid, uint32)),
       B_(foveal_k.shape(0)), H_kv_(foveal_k.shape(1)), D_(foveal_k.shape(3)),
       N_fov_(foveal_k.shape(2)), N_per_(periph_k.shape(2)), N_far_(far_k.shape(2)),
       N_static_(foveal_k.shape(2) + periph_k.shape(2) + far_k.shape(2)),
       spike_margin_(spike_margin), max_ov_(max_ov)
 {
+    // Materialize packed arrays
+    eval({periph_k_scale_, pv_s_, far_k_scale_, fv_s_});
 }
 
 std::vector<array> FoveatedHandle::operator()(
@@ -501,54 +683,38 @@ std::vector<array> FoveatedHandle::operator()(
     int total_bh_q = B_ * H_q;
     int S_total = N_static_ + n_decode;
     int split_size = adaptive_split_size(S_total);
+    int num_splits = (S_total + split_size - 1) / split_size;
 
-    // Build config for kernel lookup/compilation
     Config cfg;
     cfg.n_fov = N_fov_; cfg.n_per = N_per_; cfg.n_far = N_far_;
     cfg.head_dim = D_; cfg.h_q = H_q; cfg.h_kv = H_kv_;
-    cfg.split_size = split_size;
-    cfg.max_ov = max_ov_;
+    cfg.split_size = split_size; cfg.max_ov = max_ov_;
     cfg.spike_margin = spike_margin_;
 
-    const auto& kernels = get_kernels(cfg);
+    const auto& merged = get_merged(cfg, num_splits);
 
-    int num_splits = (S_total + split_size - 1) / split_size;
-    int partial_size = num_splits * total_bh_q;
-
-    // Only dynamic work: flatten query + build rt_params
     auto q_flat = reshape(query, {total_bh_q, D_});
-    auto sk_rt = array({(uint32_t)total_bh_q, (uint32_t)n_decode}, uint32);
+    auto rt = array({(uint32_t)total_bh_q, (uint32_t)n_decode}, uint32);
 
-    // Input list: rt_params + query(dynamic) + 15 static(pre-reshaped) + decode(dynamic) + overrides(dynamic)
-    std::vector<array> sk_inputs = {
-        sk_rt, q_flat,
+    // 19 inputs: rt + query + 11 pre-packed statics + 6 dynamic
+    std::vector<array> inputs = {
+        rt, q_flat,
         foveal_k_, foveal_v_,
-        periph_k_, periph_v_, periph_k_scale_, periph_k_zero_, pv_s_, pv_z_,
-        far_k_, far_v_, far_k_scale_, far_k_zero_, fv_s_, fv_z_,
+        periph_k_, periph_v_,
+        periph_k_scale_, pv_s_,   // packed scale+zero
+        far_k_, far_v_,
+        far_k_scale_, fv_s_,      // packed scale+zero
         fov_valid_u32_,
         decode_k, decode_v,
         override_k, override_v, override_far_idx, override_count
     };
 
-    auto partials = kernels.sk_fn(
-        sk_inputs,
-        {{partial_size, D_}, {partial_size}, {partial_size},
-         {partial_size}, {partial_size}, {partial_size}},
-        {float32, float32, float32, float32, float32, int32},
-        {num_splits * total_bh_q * 32, 1, 1},
-        {32, 1, 1},
-        {}, 0.0f, false, StreamOrDevice{});
-
-    auto red_rt = array({(uint32_t)num_splits, (uint32_t)total_bh_q}, uint32);
-    std::vector<array> red_inputs = {red_rt};
-    red_inputs.insert(red_inputs.end(), partials.begin(), partials.end());
-
-    auto outputs = kernels.red_fn(
-        red_inputs,
+    auto outputs = merged.fn(
+        inputs,
         {{total_bh_q, D_}, {total_bh_q}, {total_bh_q}},
         {float16, int32, int32},
-        {total_bh_q * 32, 1, 1},
-        {32, 1, 1},
+        {total_bh_q * num_splits * 32, 1, 1},
+        {num_splits * 32, 1, 1},
         {}, std::nullopt, false, StreamOrDevice{});
 
     return {

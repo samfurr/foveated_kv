@@ -187,8 +187,28 @@ class MLXFoveatedLayer:
         if self._kcache is not None:
             return
 
-        # Always use Python merged kernel path (packed statics, single dispatch).
-        # The C++ FoveatedHandle uses unpacked 23-input two-pass which is slower.
+        # Try C++ handle (merged kernel, pre-packed statics, single dispatch)
+        if _cpp_ext_available:
+            from .metal_foveated import MAX_OV
+            self._kcache = {
+                'cpp_handle': _FoveatedHandle(
+                    self.foveal_k, self.foveal_v,
+                    self.periph_k, self.periph_v,
+                    self.periph_k_scale, self.periph_k_zero,
+                    self.periph_v_scale, self.periph_v_zero,
+                    self.far_k, self.far_v,
+                    self.far_k_scale, self.far_k_zero,
+                    self.far_v_scale, self.far_v_zero,
+                    self.foveal_valid,
+                    spike_margin=0.5,
+                    max_ov=MAX_OV,
+                ),
+                'B': self.foveal_k.shape[0],
+                'H_kv': self.foveal_k.shape[1],
+                'D': self.foveal_k.shape[-1],
+            }
+            return
+
         from .metal_foveated import optimal_split_size, MAX_OV
 
         B = self.foveal_k.shape[0]

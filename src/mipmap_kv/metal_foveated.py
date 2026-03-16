@@ -598,7 +598,7 @@ def _build_merged_kernel(n_fov, n_per, n_far, head_dim, h_q, h_kv,
             "override_count",               # 18: (H,) int32
         ],
         output_names=["out", "spike_flags", "spike_tokens"],
-        header=header, source=_MERGED_SOURCE, ensure_row_contiguous=False,
+        header=header, source=_MERGED_SOURCE, ensure_row_contiguous=True,
     )
 
 

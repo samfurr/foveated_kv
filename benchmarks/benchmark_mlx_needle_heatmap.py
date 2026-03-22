@@ -16,8 +16,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import MLXTierConfig
-from mipmap_kv.mlx_generate import needle_test
+from foveated_kv.mlx_foveated import MLXTierConfig
+from foveated_kv.mlx_generate import needle_test
 
 
 def main():
@@ -35,8 +35,7 @@ def main():
 
     configs = [
         ("standard", None),
-        ("foveated_5_25", MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)),
-        ("foveated_2_18", MLXTierConfig(foveal_pct=0.02, periph_pct=0.18)),
+        ("foveated_10_90", MLXTierConfig()),
     ]
 
     results = {"model": args.model, "trials": args.trials, "grid": []}
@@ -46,8 +45,8 @@ def main():
     t_start = time.perf_counter()
 
     print(f"Grid: {len(args.contexts)} contexts x {len(args.depths)} depths x {args.trials} trials")
-    print(f"{'Context':>8} {'Depth':>6} {'Std':>5} {'5/25':>5} {'2/18':>5}")
-    print("-" * 35)
+    print(f"{'Context':>8} {'Depth':>6} {'Std':>5} {'10/90':>5}")
+    print("-" * 30)
 
     for ctx in args.contexts:
         for depth in args.depths:
@@ -69,12 +68,11 @@ def main():
                 cell[method_name] = passes >= (args.trials // 2 + 1)  # majority vote
 
             s = "Y" if cell.get("standard") else "N"
-            f5 = "Y" if cell.get("foveated_5_25") else "N"
-            f2 = "Y" if cell.get("foveated_2_18") else "N"
+            f10 = "Y" if cell.get("foveated_10_90") else "N"
             done += 1
             elapsed = time.perf_counter() - t_start
             eta = (elapsed / done) * (total - done) if done > 0 else 0
-            print(f"{ctx:>8} {depth:>6.1f} {s:>5} {f5:>5} {f2:>5}  [{done}/{total}, ETA {eta:.0f}s]")
+            print(f"{ctx:>8} {depth:>6.1f} {s:>5} {f10:>5}  [{done}/{total}, ETA {eta:.0f}s]")
 
             results["grid"].append(cell)
 

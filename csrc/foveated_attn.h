@@ -1,107 +1,137 @@
 #pragma once
 
+#include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "mlx/mlx.h"
+#include "mlx/primitives.h"
+#include "promotion_pipeline.h"
+
+namespace MTL { class Buffer; class ComputePipelineState; }
 
 namespace foveated {
 
-struct Config {
-    int n_fov, n_per, n_far;
-    int head_dim, h_q, h_kv;
-    int split_size;
-    int max_ov;
+// ============================================================================
+// Shared structs — match the Metal kernel layout exactly
+//
+// 2-tier: near (fp16) + far (fp8 E4M3 K, int4 V)
+// ============================================================================
+
+struct BlobLayout {
+    size_t near_k, near_v;
+    size_t far_k, far_v;
+    size_t far_v_scale, far_v_zero;
+    size_t near_valid;
+    size_t total;
+};
+
+struct BlobOffsets {
+    uint32_t near_k, near_v;
+    uint32_t far_k, far_v;
+    uint32_t far_v_scale, far_v_zero;
+    uint32_t near_valid;
+};
+
+struct FoveatedParams {
+    uint32_t total_bh_q;
+    uint32_t n_decode;
     float spike_margin;
 };
 
-// Build the Metal kernel source string with config constants injected.
-// Returns (splitk_source, reduce_source).
-std::pair<std::string, std::string> build_kernel_sources(const Config& cfg);
 
-// Foveated attention: takes all inputs (static + dynamic), returns
-// (output, spike_flags, spike_tokens).
-// This is the Phase 1 stateless API — all 22 inputs passed each call.
-std::vector<mlx::core::array> foveated_attention(
-    // Static tier arrays (15)
-    const mlx::core::array& foveal_k,
-    const mlx::core::array& foveal_v,
-    const mlx::core::array& periph_k,
-    const mlx::core::array& periph_v,
-    const mlx::core::array& periph_k_scale,
-    const mlx::core::array& periph_k_zero,
-    const mlx::core::array& periph_v_scale,
-    const mlx::core::array& periph_v_zero,
-    const mlx::core::array& far_k,
-    const mlx::core::array& far_v,
-    const mlx::core::array& far_k_scale,
-    const mlx::core::array& far_k_zero,
-    const mlx::core::array& far_v_scale,
-    const mlx::core::array& far_v_zero,
-    const mlx::core::array& foveal_valid,
-    // Dynamic arrays (7)
-    const mlx::core::array& query,
-    const mlx::core::array& decode_k,
-    const mlx::core::array& decode_v,
-    const mlx::core::array& override_k,
-    const mlx::core::array& override_v,
-    const mlx::core::array& override_far_idx,
-    const mlx::core::array& override_count,
-    // Config
-    float spike_margin = 0.5f,
-    int split_size = 256);
+// ============================================================================
+// FoveatedPrimitive: zero-overhead eval_gpu
+// ============================================================================
 
-// Stateful handle: pre-binds 15 static arrays after compression.
-// __call__ takes only 7 dynamic inputs per decode step.
+class FoveatedPrimitive : public mlx::core::Primitive {
+ public:
+    FoveatedPrimitive(
+        mlx::core::Stream stream,
+        MTL::ComputePipelineState* pipeline,
+        const MTL::Buffer* blob_buf,
+        int64_t blob_offset,
+        BlobOffsets blob_offsets,
+        FoveatedParams params,
+        int total_bh_q,
+        int num_splits)
+        : Primitive(stream),
+          pipeline_(pipeline),
+          blob_buf_(blob_buf),
+          blob_offset_(blob_offset),
+          blob_offsets_(blob_offsets),
+          params_(params),
+          total_bh_q_(total_bh_q),
+          num_splits_(num_splits) {}
+
+    void eval_cpu(
+        const std::vector<mlx::core::array>& inputs,
+        std::vector<mlx::core::array>& outputs) override {
+        throw std::runtime_error("FoveatedPrimitive only runs on GPU");
+    }
+
+    void eval_gpu(
+        const std::vector<mlx::core::array>& inputs,
+        std::vector<mlx::core::array>& outputs) override;
+
+    const char* name() const override { return "FoveatedPrimitive"; }
+
+    bool is_equivalent(const Primitive& other) const override {
+        auto* o = dynamic_cast<const FoveatedPrimitive*>(&other);
+        return o && pipeline_ == o->pipeline_
+            && params_.total_bh_q == o->params_.total_bh_q
+            && params_.n_decode == o->params_.n_decode;
+    }
+
+ private:
+    MTL::ComputePipelineState* pipeline_;
+    const MTL::Buffer* blob_buf_;
+    int64_t blob_offset_;
+    BlobOffsets blob_offsets_;
+    FoveatedParams params_;
+    int total_bh_q_;
+    int num_splits_;
+};
+
+
+// ============================================================================
+// FoveatedHandle: per-layer attention cache + kernel dispatch
+//
+// Does NOT own the promotion pipeline. The pipeline is a separate object
+// that spans all layers. FoveatedHandle exposes get_blob_info() so the
+// pipeline can register each layer's blob independently.
+// ============================================================================
+
 class FoveatedHandle {
  public:
     FoveatedHandle(
-        const mlx::core::array& foveal_k,
-        const mlx::core::array& foveal_v,
-        const mlx::core::array& periph_k,
-        const mlx::core::array& periph_v,
-        const mlx::core::array& periph_k_scale,
-        const mlx::core::array& periph_k_zero,
-        const mlx::core::array& periph_v_scale,
-        const mlx::core::array& periph_v_zero,
-        const mlx::core::array& far_k,
-        const mlx::core::array& far_v,
-        const mlx::core::array& far_k_scale,
-        const mlx::core::array& far_k_zero,
-        const mlx::core::array& far_v_scale,
-        const mlx::core::array& far_v_zero,
-        const mlx::core::array& foveal_valid,
+        const mlx::core::array& near_k, const mlx::core::array& near_v,
+        const mlx::core::array& far_k, const mlx::core::array& far_v,
+        const mlx::core::array& far_v_scale, const mlx::core::array& far_v_zero,
+        const mlx::core::array& near_valid,
         float spike_margin = 0.5f,
-        int max_ov = 32);
+        const std::string& metallib_path = "");
 
-    // Per-step dispatch: 7 dynamic inputs only
+    // Dispatch: query + decode K,V → (output, spike_flags, spike_tokens)
     std::vector<mlx::core::array> operator()(
         const mlx::core::array& query,
-        const mlx::core::array& decode_k,
-        const mlx::core::array& decode_v,
-        const mlx::core::array& override_k,
-        const mlx::core::array& override_v,
-        const mlx::core::array& override_far_idx,
-        const mlx::core::array& override_count);
+        const mlx::core::array& decode_k, const mlx::core::array& decode_v);
 
- public:
-    struct BlobLayout {
-        size_t foveal_k, foveal_v;           // fp16
-        size_t periph_k, periph_v;           // uint8
-        size_t periph_k_sz, periph_v_sz;     // fp16 (scale+zero packed)
-        size_t far_k, far_v;                 // uint8
-        size_t far_k_sz, far_v_sz;           // fp16 (scale+zero packed)
-        size_t foveal_valid;                 // uint32
-        size_t total;
-    };
+    // Expose blob write info for the promotion pipeline to register.
+    BlobWriteInfo get_blob_info() const;
 
  private:
     mlx::core::array blob_;
-    BlobLayout layout_;
+    const MTL::Buffer* blob_buf_;
+    int64_t blob_offset_;
+    BlobOffsets blob_offsets_;
 
-    int B_, H_kv_, D_, N_fov_, N_per_, N_far_, N_static_;
+    std::unordered_map<uint64_t, MTL::ComputePipelineState*> pipelines_;
+
+    int B_, H_kv_, D_, N_near_, N_far_, N_static_;
     float spike_margin_;
-    int max_ov_;
+    std::string metallib_path_;
 };
 
 } // namespace foveated

@@ -20,13 +20,13 @@ import time
 import mlx.core as mx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import (
+from foveated_kv.mlx_foveated import (
     MLXFoveatedKVCache,
     MLXFoveatedLayer,
     MLXTierConfig,
     standard_attention_mlx,
 )
-from mipmap_kv.mlx_quantize import (
+from foveated_kv.mlx_quantize import (
     dequantize_int4_per_token,
     dequantize_int8_per_channel,
     dequantize_int8_per_token,
@@ -124,8 +124,7 @@ def run_quality_benchmark(
                 "mae": err,
                 "bytes_per_elem": bytes_per_elem,
                 "compression": stats["compression"],
-                "foveal_tokens": cache.layers[0].foveal_k.shape[2],
-                "periph_tokens": cache.layers[0].periph_k.shape[2],
+                "near_tokens": cache.layers[0].near_k.shape[2],
                 "far_tokens": cache.layers[0].far_k.shape[2],
             }
         )
@@ -156,7 +155,7 @@ def run_latency_benchmark(
     )
 
     # Foveated (eager)
-    cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+    cfg = MLXTierConfig()
     cache = MLXFoveatedKVCache(cfg)
     cache.update(keys, values, 0)
     cache.compress()
@@ -214,9 +213,7 @@ def run_memory_benchmark(
     keys, values = generate_synthetic_kv(B, n_kv_heads, seq_len, head_dim)
 
     configs = [
-        ("5/25/70", MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)),
-        ("2/18/80", MLXTierConfig(foveal_pct=0.02, periph_pct=0.18)),
-        ("10/30/60", MLXTierConfig(foveal_pct=0.10, periph_pct=0.30)),
+        ("10/90", MLXTierConfig()),
     ]
 
     results = {"seq_len": seq_len, "fp16_mb": fp16_bytes / (1024 * 1024)}
@@ -247,24 +244,24 @@ def run_bandwidth_analysis(
     # Standard fp16: read all K + V
     fp16_bytes = S * n_kv_heads * D * 2 * 2  # 2 bytes per fp16, K + V
 
-    # Foveated 5/25/70 tier sizes
-    R = int(S * 0.05)  # foveal
-    M = int(S * 0.25)  # peripheral
-    F = S - R - M  # far
+    # Foveated 10/90 tier sizes (2-tier)
+    R = int(S * 0.10)  # near
+    F = S - R  # far
 
-    # Foveal: fp16 K + fp16 V = 4 bytes/elem
-    fov_bytes = R * n_kv_heads * D * 4
-    # Peripheral: INT8 K + INT8 V + scales = ~2 bytes/elem + overhead
-    per_bytes = M * n_kv_heads * D * 2 + M * n_kv_heads * 2 * 4  # scales
-    # Far: INT8 K + INT4 V = 1.5 bytes/elem + overhead
-    far_bytes = F * n_kv_heads * D + F * n_kv_heads * D // 2 + F * n_kv_heads * 2 * 4
+    # Near: fp16 K + fp16 V = 4 bytes/elem
+    near_bytes = R * n_kv_heads * D * 4
+    # Far: fp8 E4M3 K (1 byte/elem) + int4 V (0.5 bytes/elem)
+    #   + per-token scale/zero (2 × fp16 = 4 bytes/token)
+    far_k_bytes = F * n_kv_heads * D * 1        # fp8 K
+    far_v_bytes = F * n_kv_heads * D // 2        # int4 nibble-packed V
+    far_sz_bytes = F * n_kv_heads * 4            # per-token scale + zero (fp16 each)
+    far_bytes = far_k_bytes + far_v_bytes + far_sz_bytes
 
-    fov_total = fov_bytes + per_bytes + far_bytes
+    fov_total = near_bytes + far_bytes
 
     # NOTE: Without fused dequant, actual bandwidth is higher because
     # dequantized fp16 intermediates are written and read again.
-    # With MLX compile fusion, intermediates may stay in registers/cache.
-    dequant_overhead = (M + F) * n_kv_heads * D * 2  # write fp16 intermediate
+    dequant_overhead = F * n_kv_heads * D * 4  # K + V materialized as fp16
 
     return {
         "seq_len": S,
@@ -273,7 +270,7 @@ def run_bandwidth_analysis(
         "foveated_with_dequant_mb": (fov_total + dequant_overhead) / (1024 * 1024),
         "theoretical_speedup_fused": fp16_bytes / max(fov_total, 1),
         "theoretical_speedup_unfused": fp16_bytes / max(fov_total + dequant_overhead, 1),
-        "tier_sizes": {"foveal": R, "peripheral": M, "far": F},
+        "tier_sizes": {"near": R, "far": F},
     }
 
 
@@ -331,9 +328,7 @@ def main():
     print("=" * 70)
 
     quality_configs = [
-        ("foveated-5/25/70", MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)),
-        ("foveated-2/18/80", MLXTierConfig(foveal_pct=0.02, periph_pct=0.18)),
-        ("foveated-10/30/60", MLXTierConfig(foveal_pct=0.10, periph_pct=0.30)),
+        ("foveated-10/90", MLXTierConfig()),
     ]
 
     for seq_len in args.contexts:
@@ -362,7 +357,7 @@ def main():
         all_results["memory"].append(mem)
 
         print(f"\n  Context: {seq_len:,} tokens | fp16: {mem['fp16_mb']:.1f} MB")
-        for cfg_name in ["5/25/70", "2/18/80", "10/30/60"]:
+        for cfg_name in ["10/90"]:
             q_mb = mem[f"{cfg_name}_quantized_mb"]
             comp = mem[f"{cfg_name}_compression"]
             print(f"    {cfg_name}: {q_mb:.1f} MB ({comp:.2f}x compression)")

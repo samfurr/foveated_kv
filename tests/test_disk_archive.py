@@ -7,8 +7,8 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 import numpy as np
 
-from mipmap_kv.disk_archive import DiskArchive, create_disk_archive, offload_cache_to_disk
-from mipmap_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
+from foveated_kv.disk_archive import DiskArchive, create_disk_archive, offload_cache_to_disk
+from foveated_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
 
 
 class TestDiskArchive:
@@ -118,7 +118,7 @@ class TestOffloadCache:
         values = mx.random.normal((B, H_kv, S, D)).astype(mx.float16)
         mx.eval(keys, values)
 
-        cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+        cfg = MLXTierConfig()
         cache = MLXFoveatedKVCache(cfg)
         cache.update(keys, values, 0)
         cache.compress()
@@ -141,7 +141,7 @@ class TestOffloadCache:
             assert pk.shape == (1, 1, 1, D)
 
     def test_offload_multi_layer(self):
-        cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+        cfg = MLXTierConfig()
         cache = MLXFoveatedKVCache(cfg)
         for i in range(4):
             keys = mx.random.normal((1, 2, 128, 64)).astype(mx.float16)

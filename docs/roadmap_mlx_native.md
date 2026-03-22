@@ -75,7 +75,8 @@ SDPA.
 binding buffers through `set_input_array` (which does dependency
 tracking against the command encoder's output set).
 
-The fix: the 11 static tier arrays never change after compression.
+The fix: the 7 static tier arrays (near_k, near_v, far_k, far_v,
+far_v_scale, far_v_zero, near_valid) never change after compression.
 Bind them via `set_buffer` using their raw `MTL::Buffer*` pointer,
 extracted once at construction:
 
@@ -87,7 +88,7 @@ for (auto& arr : static_arrays) {
 }
 
 // In eval_gpu (every call):
-for (int i = 0; i < 11; i++)
+for (int i = 0; i < 7; i++)
     enc.set_buffer(static_bufs_[i], buffer_idx + i, static_offsets_[i]);
 ```
 
@@ -97,13 +98,11 @@ returns the data address — wrong level of indirection. This is confirmed
 in MLX's allocator source where the Metal buffer is obtained via
 `static_cast<MTL::Buffer*>(buffer.ptr())`.
 
-Only the 7 dynamic inputs (query, decode K/V, override arrays) go
-through `set_input_array` for proper dependency tracking. The statics
-have no dependencies — they were evaluated during compression and never
-change.
-
-Graph inputs drop from 19 (or 9 with blob) to 7. The evaluator only
-tracks 7 edges per node instead of 19.
+Only the 3 dynamic inputs (query, decode_k, decode_v) go through
+`set_input_array` for proper dependency tracking. The statics have no
+dependencies — they were evaluated during compression and never change.
+Override buffers have been eliminated; promotions go directly into the
+blob's near-tier headroom via the C++ PromotionPipeline.
 
 ### 3. Merged Kernel + dispatch_threadgroups
 
@@ -156,8 +155,7 @@ void FoveatedPrimitive::eval_gpu(
         enc.set_buffer(static_bufs_[i], i, static_offsets_[i]);
 
     // Dynamic inputs — standard set_input_array for dependency tracking
-    // inputs[0]: query, [1]: decode_k, [2]: decode_v,
-    // [3-6]: override arrays
+    // inputs[0]: query, [1]: decode_k, [2]: decode_v
     int idx = n_static_;
     for (int i = 0; i < inputs.size(); i++)
         enc.set_input_array(inputs[i], idx++);
@@ -186,18 +184,18 @@ hash map mutex contention.
 
 ### Python Integration
 
-The `FoveatedHandleDirect` nanobind class creates `FoveatedPrimitive`
+The `FoveatedHandle` nanobind class creates `FoveatedPrimitive`
 graph nodes via `array::make_arrays`. The interceptor calls it:
 
 ```python
 # In _fused_sdpa_interceptor:
-out, flags, tokens = handle(query, decode_k, decode_v,
-                            ov_k, ov_v, ov_idx, ov_cnt)
+out, flags, tokens = handle(query, decode_k, decode_v)
 ```
 
-One nanobind call per layer. The primitive's `eval_gpu` runs on the
-same path as SDPA. The evaluator processes `FoveatedPrimitive` nodes
-the same way it processes `ScaledDotProductAttention` nodes — through
+One nanobind call per layer (3 dynamic inputs, no override arrays).
+The primitive's `eval_gpu` runs on the same path as SDPA. The evaluator
+processes `FoveatedPrimitive` nodes the same way it processes
+`ScaledDotProductAttention` nodes — through
 the generic `arr.primitive().eval_gpu()` virtual dispatch with no
 special-casing either way.
 
@@ -261,18 +259,21 @@ end-to-end decode from ~130ms to ~35ms on the 0.5B model.
 At that point, the fused kernel adds approximately 5ms of total overhead
 over standard SDPA (from the 7 dynamic input bindings + runtime params).
 The remaining comparison is pure GPU compute: our merged kernel reading
-INT8/INT4 vs SDPA reading fp16. Break-even at short context, bandwidth
+fp8/INT4 vs SDPA reading fp16. Break-even at short context, bandwidth
 wins at long context.
 
 ## Phases
 
-| Phase | What | Effort |
+| Phase | What | Status |
 |-------|------|--------|
-| 1 | Extract kernel to .metal file, compile with mlx_build_metallib | 0.5 day |
-| 2 | Update FoveatedPrimitive eval_gpu: load metallib, set_buffer for statics | 1 day |
-| 3 | Metal function constants for tier specialization | 0.5 day |
-| 4 | Benchmark: verify SDPA-equivalent dispatch overhead | 0.5 day |
-| 5 | End-to-end validation on 0.5B + larger models | 1 day |
+| 1 | Extract kernel to .metal file, compile with mlx_build_metallib | **Done** |
+| 2 | FoveatedPrimitive eval_gpu: precompiled metallib, set_buffer for statics | **Done** |
+| 3 | Metal function constants for tier specialization | **Done** |
+| 4 | Benchmark: verify dispatch overhead reduction | **Done** |
+| 5 | Remove old CustomKernel path, make FoveatedPrimitive the sole pipeline | **Done** |
+| 6 | End-to-end validation on 0.5B + larger models | Pending |
 
-Total: ~3 days of focused work. No MLX fork. Same `csrc/` directory,
-same build system, same nanobind module.
+The old CustomKernel path (fast::metal_kernel) has been removed. The C++
+extension now uses FoveatedPrimitive exclusively. The Python Metal kernel
+path in `metal_foveated.py` remains as a fallback when the C++ extension
+is not built.

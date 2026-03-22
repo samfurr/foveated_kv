@@ -33,8 +33,8 @@ import time
 import mlx.core as mx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
-from mipmap_kv.mlx_generate import (
+from foveated_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
+from foveated_kv.mlx_generate import (
     FusedCacheWrapper,
     install_fused_sdpa,
     uninstall_fused_sdpa,
@@ -42,8 +42,7 @@ from mipmap_kv.mlx_generate import (
     prefill_and_compress,
     _fused_state,
 )
-from mipmap_kv.disk_archive import offload_cache_to_disk
-from mipmap_kv.mlx_async_promoter import AsyncPromoter
+from foveated_kv.disk_archive import offload_cache_to_disk
 
 
 def build_passkey_prompt(tokenizer, context_len: int, depth: float, passkey: str) -> str:
@@ -114,28 +113,47 @@ def run_frozen(model, tokenizer, tokens, cfg, max_tokens=20):
 
 
 def run_promoted(model, tokenizer, tokens, cfg, max_tokens=20):
-    """Fused kernel + async override promotion."""
+    """Fused kernel + C++ promotion pipeline."""
     tmpdir = tempfile.mkdtemp(prefix="fov_promo_bench_")
     try:
         fov_cache, prefill_logits, _ = prefill_and_compress(model, tokens, cfg)
         disk_archives = offload_cache_to_disk(fov_cache, tmpdir)
-        promoter = AsyncPromoter(fov_cache, disk_archives)
 
+        from foveated_kv.mlx_foveated import _cpp_available, _PromotionPipeline
+        if not _cpp_available or _PromotionPipeline is None:
+            raise RuntimeError("C++ extension required for promotion benchmark")
+
+        import numpy as _np
+        n_layers = len(fov_cache.layers)
+        cpp_pipeline = _PromotionPipeline(n_layers)
         for i, layer in enumerate(fov_cache.layers):
-            if layer is not None:
-                layer.overrides = promoter.overrides_for_layer(i)
+            if layer is None:
+                continue
+            layer._ensure_kcache()
+            handle = layer._kcache.get("cpp_handle")
+            if handle is not None:
+                cpp_pipeline.register_blob(i, handle.get_blob_info())
+            if i < len(disk_archives) and disk_archives[i] is not None:
+                archive = disk_archives[i]
+                archive_idx = _np.array(archive.idx).flatten().tolist()
+                cpp_pipeline.register_archive(
+                    i, archive.path_k, archive.path_v,
+                    archive.H_kv, archive.S_arc, archive.D,
+                    archive_idx)
 
         wrappers = [
             FusedCacheWrapper(l, i) if l else None
             for i, l in enumerate(fov_cache.layers)
         ]
-        install_fused_sdpa(fov_cache, promoter=promoter)
+        install_fused_sdpa(fov_cache)
         _fused_state._fused_wrappers = wrappers
+        _fused_state._cpp_pipeline_handle = cpp_pipeline
 
         gen = generate_short(model, tokenizer, wrappers, prefill_logits, max_tokens)
-        stats = promoter.get_stats()
+
+        stats = cpp_pipeline.get_stats()
+        cpp_pipeline.stop()
         uninstall_fused_sdpa()
-        promoter.stop()
         return gen, stats
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -174,7 +192,7 @@ def main():
 
     from mlx_lm import load
     model, tokenizer = load(args.model)
-    cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+    cfg = MLXTierConfig()
 
     results = []
 
@@ -256,7 +274,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w") as f:
-        json.dump({"model": args.model, "config": {"foveal_pct": 0.05, "periph_pct": 0.25}, "results": results}, f, indent=2)
+        json.dump({"model": args.model, "config": {"near_pct": 0.10}, "results": results}, f, indent=2)
     print(f"\nSaved to {args.output}")
 
 

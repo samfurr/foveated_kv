@@ -1,68 +1,134 @@
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/optional.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include "mlx/mlx.h"
 #include "foveated_attn.h"
+#include "foveated_compress.h"
 
 namespace nb = nanobind;
 using namespace mlx::core;
 
 NB_MODULE(foveated_ext, m) {
-    m.doc() = "C++ extension for foveated attention on Apple Silicon";
+    m.doc() = "Foveated 2-tier attention: near (fp16) + far (fp8 E4M3 K, int4 V)";
 
+    // ---- BlobWriteInfo (opaque, passed between FoveatedHandle and Pipeline) ----
+    nb::class_<foveated::BlobWriteInfo>(m, "BlobWriteInfo");
+
+    // ---- FoveatedHandle: per-layer attention dispatch ----
     nb::class_<foveated::FoveatedHandle>(m, "FoveatedHandle")
         .def(nb::init<
             const array&, const array&, const array&, const array&,
-            const array&, const array&, const array&, const array&,
-            const array&, const array&, const array&, const array&,
             const array&, const array&, const array&,
-            float, int>(),
-            nb::arg("foveal_k"), nb::arg("foveal_v"),
-            nb::arg("periph_k"), nb::arg("periph_v"),
-            nb::arg("periph_k_scale"), nb::arg("periph_k_zero"),
-            nb::arg("periph_v_scale"), nb::arg("periph_v_zero"),
+            float, const std::string&>(),
+            nb::arg("near_k"), nb::arg("near_v"),
             nb::arg("far_k"), nb::arg("far_v"),
-            nb::arg("far_k_scale"), nb::arg("far_k_zero"),
             nb::arg("far_v_scale"), nb::arg("far_v_zero"),
-            nb::arg("foveal_valid"),
+            nb::arg("near_valid"),
             nb::arg("spike_margin") = 0.5f,
-            nb::arg("max_ov") = 32,
-            "Create a handle with pre-bound static tier arrays.")
+            nb::arg("metallib_path") = "",
+            "Pre-bind static tier arrays into a single blob.")
         .def("__call__",
             &foveated::FoveatedHandle::operator(),
             nb::arg("query"),
             nb::arg("decode_k"), nb::arg("decode_v"),
-            nb::arg("override_k"), nb::arg("override_v"),
-            nb::arg("override_far_idx"), nb::arg("override_count"),
-            "Dispatch with dynamic inputs only (7 arrays).");
+            "Dispatch fused kernel. Returns (out, spike_flags, spike_tokens).")
+        .def("get_blob_info",
+            &foveated::FoveatedHandle::get_blob_info,
+            "Get blob write info for promotion pipeline registration.");
 
-    m.def("is_available", []() -> bool {
-        try {
-            auto q = zeros({1, 1, 1, 64}, float16);
-            auto fk = zeros({1, 1, 1, 64}, float16);
-            auto pk = zeros({1, 1, 1, 64}, uint8);
-            auto ps = zeros({1, 1, 64}, float16);
-            auto pvs = zeros({1, 1, 1}, float16);
-            auto fkk = zeros({1, 1, 1, 64}, uint8);
-            auto fvv = zeros({1, 1, 1, 32}, uint8);
-            auto fvs = zeros({1, 1, 1}, float16);
-            auto fval = full({1}, 1, uint32);
-            auto ovk = zeros({1, 32, 64}, float16);
-            auto ovv = zeros({1, 32, 64}, float16);
-            auto ovi = zeros({1, 32}, int32);
-            auto ovc = zeros({1}, int32);
+    // ---- PromotionPipeline: cross-layer promotion worker ----
+    nb::class_<foveated::PromotionPipeline>(m, "PromotionPipeline")
+        .def(nb::init<int, int, int>(),
+            nb::arg("n_layers"),
+            nb::arg("cooldown_steps") = 5,
+            nb::arg("max_per_drain") = 8,
+            "Create promotion pipeline spanning n_layers.")
+        .def("register_archive",
+            [](foveated::PromotionPipeline& self, int layer_idx,
+               const std::string& path_k, const std::string& path_v,
+               int H_kv, int S_arc, int D,
+               const std::vector<int32_t>& archive_idx) {
+                self.register_archive(layer_idx, path_k, path_v,
+                                      H_kv, S_arc, D,
+                                      archive_idx.data(), (int)archive_idx.size());
+            },
+            nb::arg("layer_idx"),
+            nb::arg("path_k"), nb::arg("path_v"),
+            nb::arg("H_kv"), nb::arg("S_arc"), nb::arg("D"),
+            nb::arg("archive_idx"),
+            "Register disk archive for one layer (builds O(1) lookup maps).")
+        .def("register_blob",
+            &foveated::PromotionPipeline::register_blob,
+            nb::arg("layer_idx"), nb::arg("info"),
+            "Register blob write target for one layer.")
+        .def("drain_spikes",
+            [](foveated::PromotionPipeline& self, int layer_idx,
+               const array& spike_flags, const array& spike_tokens,
+               const array& far_idx, int current_step) {
+                eval({spike_flags, spike_tokens, far_idx});
+                const int32_t* flags_ptr = spike_flags.data<int32_t>();
+                const int32_t* tokens_ptr = spike_tokens.data<int32_t>();
+                const int32_t* far_idx_ptr = far_idx.data<int32_t>();
+                int B = spike_flags.shape(0);
+                int H_q = spike_flags.shape(1);
+                int H_kv = far_idx.shape(1);
+                int N_far = far_idx.shape(2);
+                self.drain_spikes(layer_idx, flags_ptr, tokens_ptr, far_idx_ptr,
+                                  B, H_q, H_kv, N_far, current_step);
+            },
+            nb::arg("layer_idx"),
+            nb::arg("spike_flags"), nb::arg("spike_tokens"),
+            nb::arg("far_idx"), nb::arg("current_step"),
+            "Process kernel spike outputs for one layer (zero-copy from MLX).")
+        .def("get_stats",
+            [](foveated::PromotionPipeline& self) -> std::map<std::string, uint64_t> {
+                auto& s = self.stats();
+                return {
+                    {"spikes_detected", s.spikes_detected.load()},
+                    {"spikes_queued", s.spikes_queued.load()},
+                    {"spikes_deduplicated", s.spikes_deduplicated.load()},
+                    {"spikes_cooled_down", s.spikes_cooled_down.load()},
+                    {"promotions_completed", s.promotions_completed.load()},
+                    {"promotions_headroom_full", s.promotions_headroom_full.load()},
+                };
+            },
+            "Get promotion statistics.")
+        .def("stop",
+            &foveated::PromotionPipeline::stop,
+            "Stop the worker thread.");
 
-            auto results = foveated::foveated_attention(
-                fk, fk, pk, pk, ps, ps, pvs, pvs,
-                fkk, fvv, ps, ps, fvs, fvs, fval,
-                q, fk, fk, ovk, ovv, ovi, ovc,
-                0.5f, 256);
-            eval(results[0]);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }, "Check if the C++ foveated extension is available.");
+    // ---- Compression ----
+    nb::class_<foveated::TierConfig>(m, "TierConfig")
+        .def(nb::init<>())
+        .def_rw("near_pct", &foveated::TierConfig::near_pct)
+        .def_rw("n_sinks", &foveated::TierConfig::n_sinks)
+        .def_rw("window_size", &foveated::TierConfig::window_size)
+        .def_rw("promo_headroom_pct", &foveated::TierConfig::promo_headroom_pct)
+        .def_rw("promo_headroom_min", &foveated::TierConfig::promo_headroom_min);
+
+    nb::class_<foveated::CompressedLayer>(m, "CompressedLayer")
+        .def_ro("near_k", &foveated::CompressedLayer::near_k)
+        .def_ro("near_v", &foveated::CompressedLayer::near_v)
+        .def_ro("far_k", &foveated::CompressedLayer::far_k)
+        .def_ro("far_v", &foveated::CompressedLayer::far_v)
+        .def_ro("far_v_scale", &foveated::CompressedLayer::far_v_scale)
+        .def_ro("far_v_zero", &foveated::CompressedLayer::far_v_zero)
+        .def_ro("near_valid", &foveated::CompressedLayer::near_valid)
+        .def_ro("n_near_actual", &foveated::CompressedLayer::n_near_actual);
+
+    nb::class_<foveated::CompressHandle>(m, "CompressHandle")
+        .def(nb::init<const foveated::TierConfig&, const std::string&>(),
+            nb::arg("cfg"), nb::arg("metallib_path") = "",
+            "Build a compression handle with tier config and metallib path.")
+        .def("compress_layer", &foveated::CompressHandle::compress_layer,
+            nb::arg("keys"), nb::arg("values"),
+            "Compress one layer (graph only, no eval).")
+        .def("compress_all", &foveated::CompressHandle::compress_all,
+            nb::arg("all_keys"), nb::arg("all_values"),
+            "Compress all layers with one mx.eval at the end.");
+
+    m.def("is_available", []() -> bool { return true; },
+        "Returns true — the extension loaded successfully.");
 }

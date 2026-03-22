@@ -25,8 +25,8 @@ from benchmarks.benchmark_longbench import (
     DATASET2PROMPT,
     score_task,
 )
-from mipmap_kv.mlx_foveated import MLXTierConfig
-from mipmap_kv.mlx_generate import generate_fused, _generate_short
+from foveated_kv.mlx_foveated import MLXTierConfig
+from foveated_kv.mlx_generate import generate_fused, _generate_short
 
 # 6 tasks, one per LongBench category
 DEFAULT_TASKS = [
@@ -120,7 +120,7 @@ def run_task(model, tokenizer, task_name: str, samples: list,
             else:
                 text, _ = generate_fused(
                     model, tokenizer, prompt, max_tokens=max_gen, cfg=cfg,
-                    enable_promotion=False,
+                    enable_promotion=True,
                 )
         except Exception as e:
             text = ""
@@ -140,8 +140,7 @@ def main():
     parser.add_argument("--tasks", default=",".join(DEFAULT_TASKS))
     parser.add_argument("--max-samples", type=int, default=20)
     parser.add_argument("--max-context", type=int, default=6144)
-    parser.add_argument("--foveal-pct", type=float, default=0.05)
-    parser.add_argument("--periph-pct", type=float, default=0.25)
+    parser.add_argument("--near-pct", type=float, default=0.10)
     parser.add_argument("--output", default="results/paper/longbench_lite.json")
     args = parser.parse_args()
 
@@ -150,14 +149,13 @@ def main():
     tasks = args.tasks.split(",")
     configs = [
         ("standard", None),
-        ("foveated_5_25", MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)),
-        ("foveated_2_18", MLXTierConfig(foveal_pct=0.02, periph_pct=0.18)),
+        ("foveated_10_90", MLXTierConfig()),
     ]
 
     all_results = {"model": args.model, "max_samples": args.max_samples, "tasks": {}}
 
-    print(f"{'Task':<25} {'Category':<15} {'Standard':>10} {'5/25/70':>10} {'2/18/80':>10}")
-    print("-" * 75)
+    print(f"{'Task':<25} {'Category':<15} {'Standard':>10} {'10/90':>10}")
+    print("-" * 65)
 
     for task in tasks:
         print(f"Loading {task}...", end=" ", flush=True)
@@ -174,7 +172,7 @@ def main():
 
         scores = [task_results[m]["score"] for m, _ in configs]
         cat = TASK_CATEGORY.get(task, "")
-        print(f"{task:<25} {cat:<15} {scores[0]:>10.1f} {scores[1]:>10.1f} {scores[2]:>10.1f}")
+        print(f"{task:<25} {cat:<15} " + " ".join(f"{s:>10.1f}" for s in scores))
         all_results["tasks"][task] = task_results
 
     # Summary averages

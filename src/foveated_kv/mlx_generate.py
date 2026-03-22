@@ -1,16 +1,25 @@
 """
 mlx-lm integration for foveated KV cache.
 
-Provides the fused SDPA monkey-patch and generation loops that plug into
-mlx-lm's pipeline, routing decode attention through the fused Split-K Metal
-kernel operating directly on quantized data.
+Provides the fused SDPA interceptor and generation loops that plug into
+mlx-lm's pipeline, routing decode attention through the fused Metal kernel
+operating directly on quantized data.
 
-Pipeline:
-  1. Prefill with standard mlx-lm cache → extract K,V
-  2. Compress into MLXFoveatedKVCache
-  3. Install fused SDPA interceptor (monkey-patches mx.fast)
-  4. Decode loop — model calls flow through fused kernel automatically
-  5. Uninstall interceptor + cleanup
+Architecture:
+  The SDPA interceptor monkey-patches mx.fast.scaled_dot_product_attention.
+  During decode (seq_len=1), it routes attention through the fused Metal
+  kernel which operates on the blob (near fp16 + far fp8/int4) directly.
+  The kernel produces spike_flags/tokens as a free byproduct of attention.
+
+  Between steps, reset_fused_layer_counter() drains spikes into the C++
+  PromotionPipeline, which reads fp16 from disk mmap and writes into the
+  blob's near-tier headroom. The kernel sees promoted tokens on next
+  dispatch via near_valid[h] — zero overhead, zero kernel changes.
+
+  When the C++ extension isn't available, the fallback reconstructs fp16
+  from compressed tiers and uses standard SDPA. No promotion — just
+  compressed, frozen tiers. The C++ path is for speed; the fallback is
+  for correctness.
 """
 
 import math
@@ -27,70 +36,47 @@ def _log_softmax(x: mx.array, axis: int = -1) -> mx.array:
 
 
 # ---------------------------------------------------------------------------
-# Fused SDPA monkey-patch: route decode attention through the Metal kernel
+# Fused SDPA interceptor
 # ---------------------------------------------------------------------------
 
-# Global state for the SDPA interceptor. Using a simple namespace rather than
-# threading.local() because MLX decode is single-threaded (the async promoter
-# worker never calls SDPA). A namespace keeps things readable.
-
 class _FusedSDPAState:
-    """Global mutable state for the fused SDPA interceptor."""
+    """Minimal state for the SDPA interceptor."""
     original_sdpa = None
-    installed: bool = False
-    fov_cache: Optional[MLXFoveatedKVCache] = None
-    promoter = None
-    layer_counter: int = 0
-    n_layers: int = 0
-    decode_step: int = 0
-    pending_spikes: list = []
-    _far_idx_np_cache: dict = {}
+    _installed: bool = False
+    _fov_cache: Optional[MLXFoveatedKVCache] = None
+    _cpp_pipeline_handle = None
+    _layer_counter: int = 0
+    _n_layers: int = 0
+    _decode_step: int = 0
     _fused_wrappers: list = None
+    _fused_disabled: bool = False
 
 _fused_state = _FusedSDPAState()
 
 
 class FusedCacheWrapper:
-    """Cache wrapper for the fused SDPA path.
+    """Cache wrapper that routes attention through the fused Metal kernel.
 
-    Returns *dummy* K,V tensors because the actual attention is handled by
-    the intercepted SDPA function calling directly into the fused Metal kernel
-    on quantized data.
-
-    update_and_fetch() still captures new K,V and adds them to the foveal
-    tier so the cache stays up-to-date.
+    Returns dummy K,V tensors (the model expects them for shape compliance)
+    while actual attention is handled by the SDPA interceptor calling into
+    the fused kernel on quantized data.
     """
 
     def __init__(self, fov_layer: MLXFoveatedLayer, layer_idx: int):
         self.fov_layer = fov_layer
         self.layer_idx = layer_idx
         self.offset = fov_layer.total_tokens
-        self.latest_k = None  # captured for spike detection
-        self.latest_q = None  # actual Q from SDPA (set by interceptor)
+        self._spike_flags = None
+        self._spike_tokens = None
 
     @property
     def state(self):
         """mlx-lm checks this to determine if cache has data."""
-        return (self.fov_layer.foveal_k, self.fov_layer.foveal_v)
+        return self.fov_layer.near_k, self.fov_layer.near_v
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        """Add new token to foveal tier; return dummy K,V for shape compliance.
-
-        The model will pass these K,V into mx.fast.scaled_dot_product_attention,
-        but our interceptor ignores them and uses the fused kernel instead.
-        We still need correct shapes so the model's reshaping/assertions pass.
-
-        Args:
-            keys: (B, H_kv, 1, D) new decode token's K
-            values: (B, H_kv, 1, D) new decode token's V
-
-        Returns:
-            dummy_keys: (B, H_kv, 1, D) — single-token dummy (minimal memory)
-            dummy_values: (B, H_kv, 1, D)
-        """
-        # Capture new token + save K for spike detection (used by promoter)
+        """Add new token to decode buffer; return K,V for shape compliance."""
         self.fov_layer.add_token(keys, values)
-        self.latest_k = keys  # query proxy for spike detection
         self.offset += 1
         return keys, values
 
@@ -106,150 +92,126 @@ def _fused_sdpa_interceptor(
 ) -> mx.array:
     """Drop-in replacement for mx.fast.scaled_dot_product_attention.
 
-    For prefill (seq_len > 1): passes through to the original SDPA.
-    For decode (seq_len == 1): routes through the fused Metal kernel
-    operating directly on quantized KV data.
+    Prefill (seq_len > 1): passes through to the original SDPA.
+    Decode (seq_len == 1): routes through the fused Metal kernel.
     """
     seq_len = queries.shape[2]
 
-    # Prefill: pass through to original SDPA
     if seq_len > 1:
         return _fused_state.original_sdpa(
             queries, keys, values, scale=scale, mask=mask, **kwargs
         )
 
-    # Decode: use fused Metal kernel
     state = _fused_state
-    layer_idx = state.layer_counter
-    state.layer_counter += 1
+    layer_idx = state._layer_counter
+    state._layer_counter += 1
 
-    # Wrap around if we exceed total layers (safety)
-    if layer_idx >= state.n_layers:
-        layer_idx = layer_idx % state.n_layers
+    if layer_idx >= state._n_layers:
+        layer_idx = layer_idx % state._n_layers
 
-    fov_layer = state.fov_cache.layers[layer_idx]
-    if fov_layer is None:
-        # Layer not in foveated cache — fall back to original
+    fov_layer = state._fov_cache.layers[layer_idx]
+    if fov_layer is None or state._fused_disabled:
         return state.original_sdpa(
             queries, keys, values, scale=scale, mask=mask, **kwargs
         )
 
-    # Use attend_fused_with_spikes — spike detection is a free byproduct of
-    # the kernel's online softmax (just tracks max far score vs min foveal).
-    # Zero additional cost vs attend_fused.
-    out, flags, tokens = fov_layer.attend_fused_with_spikes(queries)
+    try:
+        out, flags, tokens = fov_layer.attend_fused_with_spikes(queries)
+    except Exception:
+        import logging
+        logging.getLogger("foveated_kv").warning(
+            "Fused Metal kernel failed — falling back to standard SDPA "
+            "for the rest of this session"
+        )
+        state._fused_disabled = True
+        return state.original_sdpa(
+            queries, keys, values, scale=scale, mask=mask, **kwargs
+        )
 
-    # Stash spike arrays on the wrapper. They're part of the same computation
-    # graph as `out`, so mx.eval(logits) materializes them for free. We
-    # process them in reset_fused_layer_counter (after eval, before next step).
+    # Stash spike arrays on the wrapper for drain at end of step.
+    # They're part of the same computation graph as `out`, so
+    # mx.eval(logits) materializes them for free.
     wrappers = state._fused_wrappers
     if wrappers is not None and layer_idx < len(wrappers):
         w = wrappers[layer_idx]
         if w is not None:
-            w.latest_q = queries
             w._spike_flags = flags
             w._spike_tokens = tokens
 
     return out
 
 
-def install_fused_sdpa(
-    fov_cache: MLXFoveatedKVCache,
-    promoter=None,
-) -> None:
-    """Monkey-patch mx.fast.scaled_dot_product_attention for fused decode.
+def install_fused_sdpa(fov_cache: MLXFoveatedKVCache) -> None:
+    """Install the fused SDPA interceptor.
 
-    Installs an interceptor that routes decode-time attention (seq_len=1)
-    through the fused Split-K Metal kernel, bypassing fp16 intermediate
-    materialization for a ~3.3x speedup.
-
-    Args:
-        fov_cache: The foveated cache with all layers populated.
-        promoter: Optional AsyncPromoter for spike-driven promotion.
+    Monkey-patches mx.fast.scaled_dot_product_attention so decode-time
+    attention (seq_len=1) routes through the fused Metal kernel.
     """
-    if _fused_state.installed:
+    if _fused_state._installed:
         raise RuntimeError("Fused SDPA already installed — call uninstall_fused_sdpa() first")
 
     _fused_state.original_sdpa = mx.fast.scaled_dot_product_attention
-    _fused_state.fov_cache = fov_cache
-    _fused_state.promoter = promoter
-    _fused_state.layer_counter = 0
-    _fused_state.n_layers = len(fov_cache.layers)
-    _fused_state.pending_spikes = []
-    _fused_state._far_idx_np_cache = {}
-    _fused_state.decode_step = 0
-    _fused_state._fused_wrappers = None  # set by generate_fused after creating wrappers
-    _fused_state.installed = True
+    _fused_state._fov_cache = fov_cache
+    _fused_state._cpp_pipeline_handle = None
+    _fused_state._layer_counter = 0
+    _fused_state._n_layers = len(fov_cache.layers)
+    _fused_state._decode_step = 0
+    _fused_state._fused_wrappers = None
+    _fused_state._fused_disabled = False
+    _fused_state._installed = True
 
     mx.fast.scaled_dot_product_attention = _fused_sdpa_interceptor
 
 
 def uninstall_fused_sdpa() -> None:
     """Restore the original mx.fast.scaled_dot_product_attention."""
-    if not _fused_state.installed:
+    if not _fused_state._installed:
         return
 
     mx.fast.scaled_dot_product_attention = _fused_state.original_sdpa
     _fused_state.original_sdpa = None
-    _fused_state.fov_cache = None
-    _fused_state.promoter = None
-    _fused_state.layer_counter = 0
-    _fused_state.n_layers = 0
-    _fused_state.installed = False
+    _fused_state._fov_cache = None
+    _fused_state._cpp_pipeline_handle = None
+    _fused_state._layer_counter = 0
+    _fused_state._n_layers = 0
+    _fused_state._decode_step = 0
+    _fused_state._fused_wrappers = None
+    _fused_state._fused_disabled = False
+    _fused_state._installed = False
 
 
 def reset_fused_layer_counter() -> None:
-    """Reset layer counter + run spike detection. Call per step.
+    """Reset layer counter and drain spikes into the C++ pipeline.
 
-    Spike detection scores one layer per step (rotating). Detected spikes
-    are queued for the background worker, which writes promoted fp16 K,V
-    to the shared-memory override buffer. The Metal kernel reads this
-    buffer directly — no main-thread promotion application needed.
+    Called once per decode step, after mx.eval(logits) has materialized
+    the spike arrays. The C++ pipeline reads spike data zero-copy from
+    unified memory, filters (cooldown, dedup, budget), and queues
+    promotions for the background worker.
     """
     state = _fused_state
-    state.layer_counter = 0
-    state.decode_step += 1
+    state._layer_counter = 0
+    state._decode_step += 1
 
-    if state.promoter is None:
+    pipeline = state._cpp_pipeline_handle
+    if pipeline is None:
         return
 
-    # --- Process kernel spike outputs from last step ---
-    # The spike flags/tokens were computed as a FREE byproduct of the fused
-    # kernel's online softmax. Batch-eval all layers' spikes in ONE sync,
-    # then hand numpy copies to the raw spike worker.
-    import numpy as _np
-    wrappers_with_spikes = []
-    all_spike_arrays = []
     for w in (state._fused_wrappers or []):
         if w is None:
             continue
-        flags = getattr(w, '_spike_flags', None)
-        tokens = getattr(w, '_spike_tokens', None)
+        flags = w._spike_flags
+        tokens = w._spike_tokens
         if flags is not None and tokens is not None:
-            all_spike_arrays.extend([flags, tokens])
-            wrappers_with_spikes.append(w)
-
-    if all_spike_arrays:
-        mx.eval(*all_spike_arrays)  # ONE GPU sync for all 24 layers
-
-        for w in wrappers_with_spikes:
-            flags_np = _np.array(w._spike_flags)
-            tokens_np = _np.array(w._spike_tokens)
-            far_idx_np = _np.array(w.fov_layer.far_idx)
-            try:
-                state.promoter._raw_spike_queue.put_nowait(
-                    (w.layer_idx, flags_np, tokens_np, far_idx_np)
-                )
-            except Exception:
-                pass
-            w._spike_flags = None
-            w._spike_tokens = None
+            pipeline.drain_spikes(
+                w.layer_idx, flags, tokens,
+                w.fov_layer.far_idx, state._decode_step)
+        w._spike_flags = None
+        w._spike_tokens = None
 
 
 # ---------------------------------------------------------------------------
-# End fused SDPA monkey-patch
+# Generation
 # ---------------------------------------------------------------------------
-
 
 def generate_fused(
     model,
@@ -261,30 +223,15 @@ def generate_fused(
     temp: float = 0.0,
     enable_promotion: bool = True,
 ) -> tuple[str, dict]:
-    """Generate text using fused Metal kernel for maximum decode speed.
-
-    Instead of materializing fp16 K,V intermediates and running the model's
-    own SDPA, this intercepts mx.fast.scaled_dot_product_attention and routes
-    decode attention through the fused Split-K Metal kernel that operates
-    directly on quantized data — ~3.3x faster than fp16 SDPA at 32K context.
+    """Generate text using the fused Metal kernel.
 
     Pipeline:
-      1. Prefill with standard mlx-lm cache
-      2. Build foveated cache + offload archives to disk
-      3. Install fused SDPA interceptor (monkey-patches mx.fast)
-      4. Optionally start async promoter for spike-driven tier updates
+      1. Prefill with standard mlx-lm cache → extract K,V
+      2. Compress into foveated tiers + offload archives to disk
+      3. Set up C++ promotion pipeline (if available)
+      4. Install fused SDPA interceptor
       5. Decode loop — model calls flow through fused kernel automatically
-      6. Uninstall interceptor + cleanup
-
-    Args:
-        model: mlx-lm model
-        tokenizer: mlx-lm tokenizer
-        prompt: input text
-        max_tokens: max tokens to generate
-        cfg: tier configuration
-        disk_archive_dir: directory for disk-backed archives (temp dir if None)
-        temp: sampling temperature (0 = greedy)
-        enable_promotion: if True, run async spike detection + promotion
+      6. Cleanup
 
     Returns:
         generated_text: decoded output
@@ -293,11 +240,11 @@ def generate_fused(
     import time
 
     from .disk_archive import offload_cache_to_disk
-    from .mlx_async_promoter import AsyncPromoter
+    from .mlx_foveated import _cpp_available, _PromotionPipeline
 
     tokens = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
 
-    # 1. Prefill with standard cache, then compress into foveated tiers
+    # 1. Prefill + compress
     t0 = time.perf_counter()
     fov_cache, prefill_logits, _ = prefill_and_compress(model, tokens, cfg)
     t_prefill = time.perf_counter() - t0
@@ -311,27 +258,38 @@ def generate_fused(
     disk_archives = offload_cache_to_disk(fov_cache, disk_archive_dir)
     mem_after = fov_cache.memory_bytes()
 
-    # 3. Start async promoter (optional) + wire override buffers to layers
-    promoter = None
-    if enable_promotion:
-        promoter = AsyncPromoter(fov_cache, disk_archives)
+    # 3. Set up C++ promotion pipeline
+    cpp_pipeline = None
+    if enable_promotion and _cpp_available and _PromotionPipeline is not None:
+        import numpy as _np
+        n_layers = len(fov_cache.layers)
+        cpp_pipeline = _PromotionPipeline(n_layers)
+
         for i, layer in enumerate(fov_cache.layers):
-            if layer is not None:
-                layer.overrides = promoter.overrides_for_layer(i)
+            if layer is None:
+                continue
+            layer._ensure_kcache()
+            handle = layer._kcache.get("cpp_handle")
+            if handle is not None:
+                cpp_pipeline.register_blob(i, handle.get_blob_info())
+            if i < len(disk_archives) and disk_archives[i] is not None:
+                archive = disk_archives[i]
+                archive_idx = _np.array(archive.idx).flatten().tolist()
+                cpp_pipeline.register_archive(
+                    i, archive.path_k, archive.path_v,
+                    archive.H_kv, archive.S_arc, archive.D,
+                    archive_idx)
 
-    # 4. Wrap with FusedCacheWrapper (returns dummy K,V; SDPA is intercepted)
-    fused_wrappers = []
-    for i, layer in enumerate(fov_cache.layers):
-        if layer is None:
-            fused_wrappers.append(None)
-            continue
-        fused_wrappers.append(FusedCacheWrapper(layer, i))
-
-    # 5. Install fused SDPA interceptor
-    install_fused_sdpa(fov_cache, promoter=promoter)
+    # 4. Wrap layers + install interceptor
+    fused_wrappers = [
+        FusedCacheWrapper(layer, i) if layer is not None else None
+        for i, layer in enumerate(fov_cache.layers)
+    ]
+    install_fused_sdpa(fov_cache)
     _fused_state._fused_wrappers = fused_wrappers
+    _fused_state._cpp_pipeline_handle = cpp_pipeline
 
-    # 6. Decode loop
+    # 5. Decode loop
     generated = []
     next_logits = prefill_logits[:, -1, :]
     t_decode_start = time.perf_counter()
@@ -348,7 +306,6 @@ def generate_fused(
                 break
             generated.append(token_id)
 
-            # Reset layer counter at start of each forward pass
             reset_fused_layer_counter()
 
             next_input = next_token.reshape(1, 1)
@@ -357,18 +314,14 @@ def generate_fused(
             mx.eval(next_logits)
 
     finally:
-        # 7. Always uninstall, even on error
         uninstall_fused_sdpa()
-        if promoter is not None:
-            promoter.stop()
-        # Clean up disk archive temp dir
-        if disk_archive_dir is not None:
-            import shutil
-            shutil.rmtree(disk_archive_dir, ignore_errors=True)
+        if cpp_pipeline is not None:
+            cpp_pipeline.stop()
+        import shutil
+        shutil.rmtree(disk_archive_dir, ignore_errors=True)
 
     t_decode = time.perf_counter() - t_decode_start
 
-    # Collect stats
     stats = {
         "prompt_tokens": tokens.shape[1],
         "generated_tokens": len(generated),
@@ -382,8 +335,8 @@ def generate_fused(
         "mem_archive_after_mb": mem_after["archive"] / (1024 * 1024),
         "mem_saved_mb": (mem_before["archive"] - mem_after["archive"]) / (1024 * 1024),
     }
-    if promoter is not None:
-        stats.update(promoter.get_stats())
+    if cpp_pipeline is not None:
+        stats.update(cpp_pipeline.get_stats())
 
     return tokenizer.decode(generated), stats
 
@@ -395,26 +348,19 @@ def prefill_and_compress(
 ) -> tuple[MLXFoveatedKVCache, mx.array, list]:
     """Prefill a model and compress its KV cache into foveated tiers.
 
-    Args:
-        model: mlx-lm model (nn.Module with model.layers)
-        tokens: (1, S) input token IDs
-        cfg: tier configuration
-
     Returns:
         fov_cache: compressed MLXFoveatedKVCache
         prefill_logits: (1, S, vocab) logits from prefill
-        std_caches: the original standard caches (for reference comparison)
+        std_caches: the original standard caches (for reference)
     """
     from mlx_lm.models.cache import make_prompt_cache
 
     cfg = cfg or MLXTierConfig()
 
-    # Prefill with standard cache
     std_caches = make_prompt_cache(model)
     prefill_logits = model(tokens, cache=std_caches)
     mx.eval(prefill_logits)
 
-    # Extract K,V from standard caches and build foveated cache
     fov_cache = MLXFoveatedKVCache(cfg)
     for layer_idx, cache_entry in enumerate(std_caches):
         k, v = cache_entry.state
@@ -437,14 +383,6 @@ def compute_perplexity(
 
     Prefills context_len tokens, then evaluates log-likelihood on
     the next eval_len tokens with both standard and foveated caches.
-
-    Args:
-        model: mlx-lm model
-        tokenizer: tokenizer
-        text: evaluation text (should be longer than context_len + eval_len)
-        context_len: number of tokens to prefill as context
-        eval_len: number of tokens to evaluate PPL over
-        cfg: tier config
 
     Returns:
         standard_ppl: perplexity with full fp16 cache
@@ -517,15 +455,7 @@ def needle_test(
 ) -> tuple[bool, bool, dict]:
     """Needle-in-a-haystack test: can the model retrieve a passkey?
 
-    Inserts a random 5-digit passkey at needle_depth within filler text,
-    then asks the model to retrieve it. Tests both standard and foveated.
-
-    Args:
-        model: mlx-lm model
-        tokenizer: tokenizer
-        context_len: total context length
-        needle_depth: 0.0 = beginning, 1.0 = end
-        cfg: tier config
+    Tests both standard and foveated caches.
 
     Returns:
         standard_found: did standard cache find the passkey?
@@ -537,12 +467,10 @@ def needle_test(
     cfg = cfg or MLXTierConfig()
     passkey = str(random.randint(10000, 99999))
 
-    # Build prompt with needle
     needle = f"The secret passkey is {passkey}. Remember it."
     filler_sentence = "This is a document about various topics in science and technology. "
     retrieval_prompt = "\nWhat is the secret passkey mentioned in the text above? The passkey is: "
 
-    # Estimate tokens per filler repeat
     filler_tokens = len(tokenizer.encode(filler_sentence))
     needle_tokens = len(tokenizer.encode(needle))
     retrieval_tokens = len(tokenizer.encode(retrieval_prompt))
@@ -558,17 +486,14 @@ def needle_test(
         + retrieval_prompt
     )
 
-    # Truncate to context_len tokens
     prompt_tokens = tokenizer.encode(prompt)[:context_len]
     prompt = tokenizer.decode(prompt_tokens)
 
-    # Standard generation
     std_text, _ = _generate_short(model, tokenizer, prompt, max_tokens=20)
     std_found = passkey in std_text
 
-    # Foveated generation (fused path)
     fov_text, _ = generate_fused(
-        model, tokenizer, prompt, max_tokens=20, cfg=cfg, enable_promotion=False,
+        model, tokenizer, prompt, max_tokens=20, cfg=cfg, enable_promotion=True,
     )
     fov_found = passkey in fov_text
 

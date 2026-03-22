@@ -28,8 +28,8 @@ import time
 import mlx.core as mx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
-from mipmap_kv.mlx_generate import (
+from foveated_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
+from foveated_kv.mlx_generate import (
     FusedCacheWrapper,
     install_fused_sdpa,
     uninstall_fused_sdpa,
@@ -186,17 +186,15 @@ def main():
     parser.add_argument("--model", default="mlx-community/Qwen2.5-0.5B-Instruct-bf16")
     parser.add_argument("--context-len", type=int, default=4096)
     parser.add_argument("--gen-tokens", type=int, default=200)
-    parser.add_argument("--foveal-pct", type=float, default=0.05)
-    parser.add_argument("--periph-pct", type=float, default=0.25)
+    parser.add_argument("--near-pct", type=float, default=0.10)
     parser.add_argument("--output", default="results/paper/sustained_accuracy.json")
     args = parser.parse_args()
 
     from mlx_lm import load
-    from mipmap_kv.disk_archive import offload_cache_to_disk
-    from mipmap_kv.mlx_async_promoter import AsyncPromoter
+    from foveated_kv.disk_archive import offload_cache_to_disk
 
     model, tokenizer = load(args.model)
-    cfg = MLXTierConfig(foveal_pct=args.foveal_pct, periph_pct=args.periph_pct)
+    cfg = MLXTierConfig(near_pct=args.near_pct)
 
     prompt, passkey = build_topic_shift_prompt(tokenizer, args.context_len)
     actual_ctx = len(tokenizer.encode(prompt))
@@ -246,20 +244,37 @@ def main():
 
     fov_cache_promo, promo_prefill_logits, _ = prefill_and_compress(model, tokens_mx, cfg)
     disk_archives = offload_cache_to_disk(fov_cache_promo, tmpdir)
-    promoter = AsyncPromoter(fov_cache_promo, disk_archives)
 
-    # Wire override buffers to layers so the Metal kernel can read them
+    from foveated_kv.mlx_foveated import _cpp_available, _PromotionPipeline
+    if not _cpp_available or _PromotionPipeline is None:
+        raise RuntimeError("C++ extension required for promotion benchmark")
+
+    import numpy as _np
+    n_layers = len(fov_cache_promo.layers)
+    cpp_pipeline = _PromotionPipeline(n_layers)
     for i, layer in enumerate(fov_cache_promo.layers):
-        if layer is not None:
-            layer.overrides = promoter.overrides_for_layer(i)
+        if layer is None:
+            continue
+        layer._ensure_kcache()
+        handle = layer._kcache.get("cpp_handle")
+        if handle is not None:
+            cpp_pipeline.register_blob(i, handle.get_blob_info())
+        if i < len(disk_archives) and disk_archives[i] is not None:
+            archive = disk_archives[i]
+            archive_idx = _np.array(archive.idx).flatten().tolist()
+            cpp_pipeline.register_archive(
+                i, archive.path_k, archive.path_v,
+                archive.H_kv, archive.S_arc, archive.D,
+                archive_idx)
 
     promo_wrappers = [
         FusedCacheWrapper(layer, i) if layer is not None else None
         for i, layer in enumerate(fov_cache_promo.layers)
     ]
-    install_fused_sdpa(fov_cache_promo, promoter=promoter)
-    from mipmap_kv.mlx_generate import _fused_state
+    install_fused_sdpa(fov_cache_promo)
+    from foveated_kv.mlx_generate import _fused_state
     _fused_state._fused_wrappers = promo_wrappers
+    _fused_state._cpp_pipeline_handle = cpp_pipeline
 
     t0 = time.perf_counter()
     promo_tokens, promo_trace = generate_with_logit_trace(
@@ -272,8 +287,8 @@ def main():
     uninstall_fused_sdpa()
     promo_text = tokenizer.decode(promo_tokens)
     promo_found = passkey in promo_text
-    promo_stats = promoter.get_stats()
-    promoter.stop()
+    promo_stats = cpp_pipeline.get_stats()
+    cpp_pipeline.stop()
     print(f"  {len(promo_tokens)} tokens in {promo_time:.1f}s | passkey: {'YES' if promo_found else 'NO'}")
     print(f"  Spikes: {promo_stats['spikes_detected']}, Overrides written: {promo_stats['promotions_completed']}")
     print(f"  Output: {promo_text[:100]}...")

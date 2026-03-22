@@ -20,8 +20,8 @@ import time
 import mlx.core as mx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import MLXTierConfig
-from mipmap_kv.mlx_generate import (
+from foveated_kv.mlx_foveated import MLXTierConfig
+from foveated_kv.mlx_generate import (
     compute_perplexity,
     generate_fused,
     needle_test,
@@ -120,7 +120,7 @@ def run_generation_benchmark(
         # Foveated (fused path)
         fov_text, fov_stats = generate_fused(
             model, tokenizer, prompt, max_tokens=max_tokens, cfg=cfg,
-            enable_promotion=False,
+            enable_promotion=True,
         )
         print(f"  Foveated: {fov_text[:120]}...")
 
@@ -176,9 +176,11 @@ def run_promotion_benchmark(
 
     print(f"  Output: {output[:100]}...")
     print(f"  Spikes detected: {stats.get('spikes_detected', 0)}")
+    print(f"  Spikes cooled:   {stats.get('spikes_cooled_down', 0)}")
+    print(f"  Spikes queued:   {stats.get('spikes_queued', 0)}")
+    print(f"  Deduplicated:    {stats.get('spikes_deduplicated', 0)}")
     print(f"  Promotions done: {stats.get('promotions_completed', 0)}")
     print(f"  Promotions used: {stats.get('promotions_applied', 0)}")
-    print(f"  Deduplicated:    {stats.get('spikes_deduplicated', 0)}")
     print(f"  Memory saved:    {stats['mem_saved_mb']:.1f} MB (archive → disk)")
     print(f"  Time:            {elapsed:.1f}s ({gen_tokens / elapsed:.1f} tok/s)")
 
@@ -186,7 +188,7 @@ def run_promotion_benchmark(
     print(f"  Code retrieved:  {'Yes' if found_code else 'No'}")
 
     # Baseline speed: standard cache (no foveation)
-    from mipmap_kv.mlx_generate import _generate_short  # noqa: E402
+    from foveated_kv.mlx_generate import _generate_short  # noqa: E402
     std_start = time.perf_counter()
     _generate_short(model, tokenizer, prompt, max_tokens=gen_tokens)
     std_elapsed = time.perf_counter() - std_start
@@ -256,8 +258,7 @@ def main():
     )
     parser.add_argument("--context-len", type=int, default=4096, help="PPL context length")
     parser.add_argument("--eval-len", type=int, default=128, help="PPL eval length")
-    parser.add_argument("--foveal-pct", type=float, default=0.05)
-    parser.add_argument("--periph-pct", type=float, default=0.25)
+    parser.add_argument("--near-pct", type=float, default=0.10)
     parser.add_argument("--max-tokens", type=int, default=50, help="Max tokens for generation")
     parser.add_argument("--output", type=str, default=None, help="JSON output file")
     args = parser.parse_args()
@@ -267,13 +268,10 @@ def main():
         args.needle = True
         args.promotion = True
 
-    cfg = MLXTierConfig(
-        foveal_pct=args.foveal_pct,
-        periph_pct=args.periph_pct,
-    )
+    cfg = MLXTierConfig(near_pct=args.near_pct)
 
     model, tokenizer = load_model(args.model)
-    all_results = {"model": args.model, "config": {"foveal_pct": cfg.foveal_pct, "periph_pct": cfg.periph_pct}}
+    all_results = {"model": args.model, "config": {"near_pct": cfg.near_pct}}
 
     if args.needle:
         print("\n" + "=" * 60)

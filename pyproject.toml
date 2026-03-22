@@ -1,9 +1,19 @@
 [project]
-name = "mipmap-kv-cache"
+name = "foveated-kv"
 version = "0.2.0"
 description = "FoveatedKV: Importance-adaptive mixed-precision KV cache for LLMs on Apple Silicon"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+keywords = ["llm", "kv-cache", "quantization", "mlx", "apple-silicon", "attention"]
 dependencies = [
     "mlx>=0.18",
     "mlx-lm>=0.20",
@@ -14,9 +24,13 @@ dependencies = [
     "huggingface-hub",
 ]
 
+[project.scripts]
+foveated-kv = "foveated_kv.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "datasets",
 ]
 ext = [
     "nanobind==2.10.2",
@@ -32,7 +46,7 @@ markers = ["slow: requires model download (deselect with '-m not slow')"]
 index-url = "https://pypi.org/simple"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mipmap_kv"]
+packages = ["src/foveated_kv"]
 
 [build-system]
 requires = ["hatchling"]

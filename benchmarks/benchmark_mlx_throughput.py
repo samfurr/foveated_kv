@@ -20,23 +20,39 @@ import time
 import mlx.core as mx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
-from mipmap_kv.mlx_generate import (
+from foveated_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
+from foveated_kv.mlx_generate import (
     generate_fused, _generate_short, prefill_and_compress,
 )
-from mipmap_kv.disk_archive import offload_cache_to_disk
+from foveated_kv.disk_archive import offload_cache_to_disk
 
 
 def measure_method(model, tokenizer, prompt, method, gen_tokens, cfg=None):
-    """Run one method, return timing and memory stats."""
+    """Run one method, return timing and memory stats.
+
+    Reports decode-only tok/s (excludes prefill and compression) for fair
+    comparison. Total elapsed time is also reported for pipeline context.
+    """
     t_start = time.perf_counter()
 
     if method == "standard":
         _generate_short(model, tokenizer, prompt, max_tokens=gen_tokens)
         elapsed = time.perf_counter() - t_start
+        # _generate_short includes prefill in elapsed — separate it out.
+        # Re-run with timing split: prefill then decode.
+        tokens = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
+        from mlx_lm.models.cache import make_prompt_cache
+        cache = make_prompt_cache(model)
+        t_pf = time.perf_counter()
+        logits = model(tokens, cache=cache)
+        mx.eval(logits)
+        prefill_s = time.perf_counter() - t_pf
+        decode_s = max(elapsed - prefill_s, 0.001)
         return {
-            "tok_per_s": gen_tokens / elapsed,
-            "elapsed_s": round(elapsed, 2),
+            "decode_tok_per_s": round(gen_tokens / decode_s, 1),
+            "prefill_s": round(prefill_s, 2),
+            "decode_s": round(decode_s, 2),
+            "total_s": round(elapsed, 2),
             "kv_memory_mb": "N/A (full fp16)",
         }
 
@@ -45,8 +61,10 @@ def measure_method(model, tokenizer, prompt, method, gen_tokens, cfg=None):
                                    cfg=cfg, enable_promotion=False)
         elapsed = time.perf_counter() - t_start
         return {
-            "tok_per_s": stats.get("tokens_per_second", gen_tokens / elapsed),
-            "elapsed_s": round(elapsed, 2),
+            "decode_tok_per_s": round(stats.get("tokens_per_second", gen_tokens / elapsed), 1),
+            "prefill_s": round(stats.get("prefill_time_s", 0), 2),
+            "decode_s": round(stats.get("decode_time_s", elapsed), 2),
+            "total_s": round(elapsed, 2),
         }
 
     elif method == "fused_disk":
@@ -54,8 +72,10 @@ def measure_method(model, tokenizer, prompt, method, gen_tokens, cfg=None):
                                    cfg=cfg, enable_promotion=True)
         elapsed = time.perf_counter() - t_start
         return {
-            "tok_per_s": stats.get("tokens_per_second", gen_tokens / elapsed),
-            "elapsed_s": round(elapsed, 2),
+            "decode_tok_per_s": round(stats.get("tokens_per_second", gen_tokens / elapsed), 1),
+            "prefill_s": round(stats.get("prefill_time_s", 0), 2),
+            "decode_s": round(stats.get("decode_time_s", elapsed), 2),
+            "total_s": round(elapsed, 2),
             "mem_saved_mb": round(stats.get("mem_saved_mb", 0), 1),
         }
 
@@ -70,8 +90,8 @@ def measure_compression(model, tokenizer, prompt, cfg):
 
     mem = fov_cache.memory_bytes()
     n_tokens = tokens.shape[1]
-    H_kv = fov_cache.layers[0].foveal_k.shape[1]
-    D = fov_cache.layers[0].foveal_k.shape[-1]
+    H_kv = fov_cache.layers[0].near_k.shape[1]
+    D = fov_cache.layers[0].near_k.shape[-1]
     n_layers = len(fov_cache.layers)
     fp16_kv_bytes = n_layers * 2 * H_kv * n_tokens * D * 2
 
@@ -83,8 +103,7 @@ def measure_compression(model, tokenizer, prompt, cfg):
         "compression_ratio": round(fp16_kv_bytes / max(mem["total_quantized"], 1), 2),
         "archive_mb": round(mem["archive"] / 1e6, 1),
         "compress_time_s": round(compress_time, 2),
-        "foveal_tokens": fov_cache.layers[0].foveal_k.shape[2],
-        "periph_tokens": fov_cache.layers[0].periph_k.shape[2],
+        "near_tokens": fov_cache.layers[0].near_k.shape[2],
         "far_tokens": fov_cache.layers[0].far_k.shape[2],
     }
 
@@ -99,7 +118,7 @@ def main():
 
     from mlx_lm import load
     model, tokenizer = load(args.model)
-    cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+    cfg = MLXTierConfig()
     filler = "This document discusses various topics in science and technology. " * 5
 
     all_results = {"model": args.model, "gen_tokens": args.gen_tokens, "contexts": {}}
@@ -115,7 +134,7 @@ def main():
         # Compression stats
         comp = measure_compression(model, tokenizer, prompt, cfg)
         print(f"  Compression: {comp['fp16_kv_mb']:.1f}MB → {comp['foveated_kv_mb']:.1f}MB ({comp['compression_ratio']:.2f}x)")
-        print(f"  Tiers: fov={comp['foveal_tokens']}, per={comp['periph_tokens']}, far={comp['far_tokens']}")
+        print(f"  Tiers: near={comp['near_tokens']}, far={comp['far_tokens']}")
         print(f"  Compress time: {comp['compress_time_s']:.2f}s")
 
         # Throughput (each method in clean state)
@@ -128,8 +147,10 @@ def main():
         for method_key, method_name in methods:
             gc.collect()
             result = measure_method(model, tokenizer, prompt, method_key, args.gen_tokens, cfg)
-            tps = result["tok_per_s"]
-            print(f"  {method_name:<20} {tps:>6.1f} tok/s ({result['elapsed_s']}s)")
+            dtps = result["decode_tok_per_s"]
+            pf = result["prefill_s"]
+            dec = result["decode_s"]
+            print(f"  {method_name:<20} {dtps:>6.1f} tok/s  (prefill {pf:.1f}s + decode {dec:.1f}s)")
             ctx_results["throughput"][method_key] = result
 
         all_results["contexts"][str(ctx)] = ctx_results

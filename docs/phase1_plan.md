@@ -4,7 +4,7 @@
 
 FoveatedKV started as a CUDA/A100 project, validated quality on cloud GPUs, then
 pivoted to Apple Silicon with a complete MLX native implementation including custom
-Metal GPU kernels.
+Metal GPU kernels and a C++ promotion pipeline.
 
 ## Phase 1: Prototype and Validate (PyTorch, T4/A100)
 
@@ -39,39 +39,41 @@ Rebuilt the entire system natively on MLX with custom Metal GPU kernels.
 
 **What was built:**
 
-1. **Fused Split-K Metal kernel** (`metal_foveated.py`): register-only K dequant,
-   online softmax across all tiers + decode buffer, spike detection piggybacked.
-   Compile-time N_FOV for loop unrolling.
+1. **Fused Split-K Metal kernel** (`kernels/foveated_attn.metal`): pre-scaled query,
+   single-exp `softmax_accum`, shared `attend_fp16` helper for near+decode, LUT fp8
+   decode, score-gated V loading, 4-token blocked far loop, spike detection piggybacked.
+   10 kernel variants (D=64/128 x MAX_SPLITS=1/2/4/8/16) in one metallib.
 
-2. **MLX quantization** (`mlx_quantize.py`): INT8 per-channel/per-token, INT4 packed.
-   Matches PyTorch reference exactly.
+2. **MLX quantization** (`mlx_quantize.py`): fp8 E4M3 per-token K, INT4 packed V.
 
 3. **MLXFoveatedLayer / MLXFoveatedKVCache** (`mlx_foveated.py`): full cache with
-   3 precision tiers + decode buffer.
+   2 precision tiers + decode buffer.
 
 4. **Disk-backed mmap archive** (`disk_archive.py`): numpy.memmap for NVMe-backed
-   fp16 promotion. One file per layer. ~50us per token read.
+   fp16 promotion. Separate K/V files per layer. ~50us per token read.
 
-5. **Async promotion system** (`mlx_async_promoter.py`): 2 background workers
-   (spike processing + disk reads). Fire-and-forget spike handoff. O(1) drain.
-
-6. **SDPA monkey-patch for mlx-lm** (`mlx_generate.py`): intercepts
+5. **SDPA monkey-patch for mlx-lm** (`mlx_generate.py`): intercepts
    `mx.fast.scaled_dot_product_attention`, routes decode through fused kernel.
+   Minimal `_FusedSDPAState` (8 fields), C++ pipeline spike drain.
 
-7. **Cache wrapper** for mlx-lm integration: FusedCacheWrapper.
+6. **Cache wrapper** for mlx-lm integration: FusedCacheWrapper.
 
-8. **Full benchmark suite**: LongBench-Lite, needle heatmap, ablation, throughput.
+7. **Full benchmark suite**: LongBench-Lite, needle heatmap, ablation, throughput,
+   promotion quality, sustained accuracy.
 
-## Phase 3: Optimization (Current)
+## Phase 3: C++ Extension + Promotion Pipeline (Current)
 
 Results on 8GB Mac (kernel-only, 7B shapes, 100 iters):
 
-- Kernel: 1.0x at 4K, 8.9x at 32K, 10.2x at 128K vs Apple SDPA
-- Quality: 0.996+ cosine, 2.13-2.34x compression, PPL ratio 0.993-1.003x
-- C++ extension: nanobind FoveatedHandle with blob-packed statics (9 inputs)
+- Kernel: up to 2.31x faster at 32K vs Apple SDPA
+- Quality: 0.995+ cosine, 2.02x compression, PPL ratio 0.999-1.025x
+- C++ extension: nanobind FoveatedHandle with blob-packed statics
+- FoveatedPrimitive: subclasses mlx::core::Primitive, precompiled metallib
 - Merged kernel: Split-K + Reduce in single dispatch via shared memory
-- Override buffer: double-buffered, sorted insert, kernel-side spike detection
-- 63 tests passing
+- C++ PromotionPipeline: reads fp16 from disk mmap, writes into blob
+  near-tier headroom, atomic near_valid[h] commit
+- C++ CompressHandle: GPU compression kernels for fp8 E4M3 K + INT4 V
+- 69 tests passing
 
 ## What the PyTorch Code Still Does
 

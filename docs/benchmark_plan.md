@@ -14,11 +14,10 @@ Apple Silicon Mac (8GB+). All benchmarks run locally via MLX.
 
 | Method | Avg Score |
 |--------|-----------|
-| Standard (full precision) | 9.8 |
-| Foveated 5/25/70 | 9.7 |
-| Foveated 2/18/80 | 9.7 |
+| Standard (full precision) | 14.9 |
+| Foveated 10/90 | 15.1 |
 
-Within 0.1 points. Quality preserved across tier configurations.
+Foveated matches or exceeds standard. Quality fully preserved with 2-tier 10/90 config.
 
 Scoring uses official THUDM LongBench v1 metrics: F1 (QA), ROUGE (summarization),
 accuracy (few-shot/synthetic), edit similarity (code). Dataset loaded directly from
@@ -26,9 +25,9 @@ JSONL via HuggingFace.
 
 ### 2. Needle-in-Haystack Heatmap (`benchmark_mlx_needle_heatmap.py`)
 
-Grid evaluation: context length (2K-8K) x needle depth (0%-100%).
+Grid evaluation: context length (1K-8K) x needle depth (0%-100%).
 
-**Results:** 36/36 (100%) retrieval across all depths and contexts.
+**Results:** 55/55 (100%) retrieval across all depths and contexts.
 
 No degradation from compression at any position or context length.
 
@@ -36,30 +35,32 @@ No degradation from compression at any position or context length.
 
 Component contribution analysis. Tests each design choice in isolation.
 
-**Key results:**
-- Asymmetric K/V is the critical component (130x error without it)
-- Foveal tier provides 1.5x improvement over uniform INT8
-- PPL ratios: 0.998x (1K), 0.993x (2K), 1.003x (4K) -- error does not accumulate
+**Key results (4K context, real model K,V):**
 
-Configurations tested:
-- Full system (all components)
-- No asymmetric K/V (symmetric INT4 for far tier)
-- No foveal tier (all tokens quantized uniformly)
-- Different tier splits (5/25/70, 2/18/80, 10/30/60)
+| Config | Cosine | MAE |
+|--------|--------|-----|
+| Full system (10/90) | 0.999939 | 0.0050 |
+| No near (uniform fp8+int4) | 0.999929 | 0.0055 |
+| Symmetric (int4 K + int4 V) | 0.999783 | 0.0091 |
+| Uniform INT8 (no tiers) | 1.000000 | 0.0001 |
+
+Asymmetric K/V (fp8 K + int4 V) achieves 3.6x lower cosine error than symmetric int4.
 
 ### 4. Kernel Throughput (`benchmark_mlx_throughput.py`)
 
 Metal fused kernel speed vs standard fp16 SDPA.
 
-**Results (synthetic, 7B shapes):**
+**Results (7B shapes: H_q=32, H_kv=8, D=128):**
 
-| Context | Speedup vs fp16 SDPA |
-|---------|---------------------|
-| 4K | 1.49x |
-| 8K | 1.46x |
-| 32K | 3.28x (original shapes) |
+| Context | fp16 SDPA | Fused Kernel | Speedup |
+|---------|-----------|-------------|---------|
+| 1K | 1.12 ms | 0.94 ms | 1.19x |
+| 4K | 2.33 ms | 1.46 ms | 1.60x |
+| 8K | 4.05 ms | 2.22 ms | 1.82x |
+| 16K | 7.68 ms | 3.73 ms | 2.06x |
+| 32K | 15.72 ms | 6.81 ms | 2.31x |
 
-Memory compression: 2.21x at all context lengths.
+Memory compression: 2.02x at all context lengths.
 
 ### 5. Synthetic Kernel Benchmark (`benchmark_mlx.py`)
 
@@ -70,6 +71,16 @@ controlled tensor shapes. Used for kernel development iteration.
 
 Full model inference with foveated cache via mlx-lm integration. Measures
 real-world generation speed and memory usage.
+
+**Perplexity Results (Qwen2.5-0.5B-Instruct-bf16, WikiText-103):**
+
+| Context | Standard PPL | Foveated PPL | Ratio |
+|---------|-------------|-------------|-------|
+| 1K | 6.86 | 7.03 | 1.025x |
+| 2K | 15.14 | 15.12 | 0.999x |
+| 4K | 29.17 | 29.36 | 1.007x |
+
+Foveated PPL within 2.5% of standard at all context lengths.
 
 ## Running All Benchmarks
 
@@ -104,7 +115,7 @@ MLX inference. Dataset loading uses direct JSONL from HuggingFace datasets.
 
 ## What Makes These Results Defensible
 
-1. **LongBench scoring** is aligned with official THUDM v1 pipeline (29 scoring tests)
+1. **LongBench scoring** is aligned with official THUDM v1 pipeline (29 tests verify this)
 2. **Needle retrieval** tests actual token recovery, not approximate scoring
 3. **PPL ratios** computed against same model at same context -- relative, not absolute
 4. **Kernel speed** measured with MLX's built-in timing (eval + sync)

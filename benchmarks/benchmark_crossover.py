@@ -24,7 +24,7 @@ import time
 import mlx.core as mx
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-from mipmap_kv.mlx_foveated import (
+from foveated_kv.mlx_foveated import (
     MLXFoveatedKVCache,
     MLXTierConfig,
     standard_attention_mlx,
@@ -44,7 +44,7 @@ def bench(fn, warmup=5, iters=50):
 
 def run_kernel_crossover(contexts, H_kv, H_q, D, iters=50):
     """Kernel-only: one layer, no model, no interceptor."""
-    cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+    cfg = MLXTierConfig()
     B = 1
 
     print(f"\n{'='*65}")
@@ -85,14 +85,14 @@ def run_kernel_crossover(contexts, H_kv, H_q, D, iters=50):
 def run_model_crossover(contexts, iters=10):
     """End-to-end: full model with interceptor overhead."""
     from mlx_lm import load
-    from mipmap_kv.mlx_generate import (
+    from foveated_kv.mlx_generate import (
         FusedCacheWrapper, install_fused_sdpa, uninstall_fused_sdpa,
         reset_fused_layer_counter, prefill_and_compress, _fused_state,
     )
     from mlx_lm.models.cache import make_prompt_cache
 
     model, tokenizer = load("mlx-community/Qwen2.5-0.5B-Instruct-bf16")
-    cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+    cfg = MLXTierConfig()
     tok = mx.array([[1]])
     base_text = "The quick brown fox jumps over the lazy dog and runs through the forest. " * 500
 

@@ -6,7 +6,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-from mipmap_kv.mlx_quantize import (
+from foveated_kv.mlx_quantize import (
     dequantize_int4_per_token,
     dequantize_int8_per_channel,
     dequantize_int8_per_token,
@@ -14,11 +14,15 @@ from mipmap_kv.mlx_quantize import (
     quantize_int8_per_channel,
     quantize_int8_per_token,
 )
-from mipmap_kv.mlx_foveated import (
+from foveated_kv.mlx_foveated import (
     MLXFoveatedKVCache,
     MLXFoveatedLayer,
     MLXTierConfig,
     standard_attention_mlx,
+    _fp16_to_e4m3,
+    _e4m3_to_fp16,
+    _quantize_int4_per_token,
+    _dequant_int4_per_token,
 )
 
 
@@ -122,6 +126,86 @@ class TestMLXQuantization:
         assert overlap >= 6, f"Only {overlap}/8 top-k overlap"
 
 
+# --- fp8 E4M3 + int4 roundtrip tests ---
+
+
+class TestFP8E4M3:
+    def test_roundtrip_cosine(self):
+        x = mx.random.normal((1, 2, 32, 64)).astype(mx.float16)
+        mx.eval(x)
+        encoded = _fp16_to_e4m3(x)
+        mx.eval(encoded)
+        assert encoded.dtype == mx.uint8
+        assert encoded.shape == x.shape
+        decoded = _e4m3_to_fp16(encoded)
+        mx.eval(decoded)
+        assert decoded.dtype == mx.float16
+        cos = _cosine(decoded, x)
+        assert cos > 0.95, f"fp8 E4M3 roundtrip cosine {cos:.4f} too low"
+
+    def test_zeros_preserved(self):
+        x = mx.zeros((1, 1, 4, 8), dtype=mx.float16)
+        encoded = _fp16_to_e4m3(x)
+        decoded = _e4m3_to_fp16(encoded)
+        mx.eval(decoded)
+        assert mx.all(decoded == 0).item()
+
+    def test_score_ordering_preserved(self):
+        """fp8 E4M3 K should preserve top-k attention ordering."""
+        keys = mx.random.normal((1, 1, 64, 32)).astype(mx.float16)
+        query = mx.random.normal((1, 1, 32)).astype(mx.float16)
+        mx.eval(keys, query)
+
+        scores_exact = mx.sum(
+            mx.expand_dims(query, axis=2).astype(mx.float32)
+            * keys.astype(mx.float32),
+            axis=-1,
+        )
+
+        encoded = _fp16_to_e4m3(keys)
+        decoded = _e4m3_to_fp16(encoded)
+        scores_quant = mx.sum(
+            mx.expand_dims(query, axis=2).astype(mx.float32)
+            * decoded.astype(mx.float32),
+            axis=-1,
+        )
+        mx.eval(scores_exact, scores_quant)
+
+        k = 8
+        top_exact = mx.argsort(-scores_exact, axis=-1)[:, :, :k]
+        top_quant = mx.argsort(-scores_quant, axis=-1)[:, :, :k]
+        mx.eval(top_exact, top_quant)
+
+        exact_set = set(top_exact[0, 0].tolist())
+        quant_set = set(top_quant[0, 0].tolist())
+        overlap = len(exact_set & quant_set)
+        assert overlap >= 5, f"Only {overlap}/8 top-k overlap for fp8 E4M3"
+
+
+class TestInt4PerToken:
+    def test_roundtrip_cosine(self):
+        x = mx.random.normal((1, 2, 32, 64)).astype(mx.float16)
+        mx.eval(x)
+        packed, scale, zero = _quantize_int4_per_token(x)
+        mx.eval(packed, scale, zero)
+        assert packed.dtype == mx.uint8
+        assert packed.shape == (1, 2, 32, 32)  # D//2
+        assert scale.shape == (1, 2, 32)
+        assert zero.shape == (1, 2, 32)
+        recon = _dequant_int4_per_token(packed, scale, zero)
+        mx.eval(recon)
+        assert recon.shape == x.shape
+        cos = _cosine(recon, x)
+        assert cos > 0.90, f"int4 per-token roundtrip cosine {cos:.4f} too low"
+
+    def test_zeros(self):
+        x = mx.zeros((1, 1, 4, 8), dtype=mx.float16)
+        packed, scale, zero = _quantize_int4_per_token(x)
+        recon = _dequant_int4_per_token(packed, scale, zero)
+        mx.eval(recon)
+        assert mx.allclose(recon, x, atol=1e-4).item()
+
+
 # --- Cache tests ---
 
 
@@ -129,7 +213,7 @@ class TestMLXFoveatedCache:
     def _make_cache(
         self, S=256, H_kv=2, D=64, cfg=None
     ) -> tuple[MLXFoveatedKVCache, mx.array, mx.array]:
-        cfg = cfg or MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+        cfg = cfg or MLXTierConfig()
         B = 1
         keys = mx.random.normal((B, H_kv, S, D)).astype(mx.float16)
         values = mx.random.normal((B, H_kv, S, D)).astype(mx.float16)
@@ -144,28 +228,25 @@ class TestMLXFoveatedCache:
         assert stats["compressed"]
         layer = cache.layers[0]
         assert layer is not None
-        assert layer.foveal_k.shape[2] > 0
-        assert layer.periph_k.shape[2] > 0
+        assert layer.near_k.shape[2] > 0
         assert layer.far_k.shape[2] > 0
         assert layer.total_tokens == 256
 
     def test_tier_sizes_match_config(self):
         S = 1000
-        cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25, n_sinks=4, window_size=32)
+        cfg = MLXTierConfig(near_pct=0.10, n_sinks=4, window_size=32)
         cache, _, _ = self._make_cache(S=S, cfg=cfg)
         cache.compress()
         layer = cache.layers[0]
-        # Foveal: 50 valid + headroom padding
-        assert int(mx.max(layer.foveal_valid).item()) == 50
-        assert layer.foveal_k.shape[2] > 50  # padded
-        # Peripheral: 250
-        assert layer.periph_k.shape[2] == 250
-        # Far: 700
-        assert layer.far_k.shape[2] == 700
+        # Near: 100 valid + headroom padding
+        assert int(mx.max(layer.near_valid).item()) == 100
+        assert layer.near_k.shape[2] > 100  # padded
+        # Far: 900
+        assert layer.far_k.shape[2] == 900
         # Padding slots are zeros
-        pad_start = int(layer.foveal_valid[0].item())
-        assert mx.all(layer.foveal_k[0, 0, pad_start:] == 0).item()
-        assert mx.all(layer.foveal_v[0, 0, pad_start:] == 0).item()
+        pad_start = int(layer.near_valid[0].item())
+        assert mx.all(layer.near_k[0, 0, pad_start:] == 0).item()
+        assert mx.all(layer.near_v[0, 0, pad_start:] == 0).item()
 
     def test_attend_output_shape(self):
         cache, _, _ = self._make_cache(S=256, H_kv=2, D=64)
@@ -211,8 +292,7 @@ class TestMLXFoveatedCache:
         cache.compress()
         mem = cache.memory_bytes()
         assert mem["total_quantized"] > 0
-        assert mem["foveal"] > 0
-        assert mem["peripheral"] > 0
+        assert mem["near"] > 0
         assert mem["far"] > 0
         # Quantized should be less than full fp16
         fp16_bytes = 1 * 2 * 512 * 64 * 2 * 2  # B * H * S * D * 2bytes * (K+V)
@@ -230,13 +310,13 @@ class TestMLXFoveatedCache:
         mx.eval(new_k, new_v)
         layer.add_token(new_k, new_v)
 
-        # Decode buffer holds new token; effective foveal = valid + 1 decode
+        # Decode buffer holds new token; effective near = valid + 1 decode
         assert len(layer._decode_k_buf) == 1
-        valid = int(mx.max(layer.foveal_valid).item())
-        assert layer.effective_foveal_k.shape[2] == valid + 1
+        valid = int(mx.max(layer.near_valid).item())
+        assert layer.effective_near_k.shape[2] == valid + 1
 
     def test_multi_layer(self):
-        cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+        cfg = MLXTierConfig()
         cache = MLXFoveatedKVCache(cfg)
         for i in range(4):
             keys = mx.random.normal((1, 2, 128, 64)).astype(mx.float16)
@@ -262,7 +342,7 @@ class TestMLXFoveatedCache:
     def test_spike_detection_with_extreme_token(self):
         """A far token with extreme key should trigger spike."""
         B, H, S, D = 1, 2, 256, 64
-        cfg = MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+        cfg = MLXTierConfig()
         keys = mx.random.normal((B, H, S, D)).astype(mx.float16) * 0.1
         values = mx.random.normal((B, H, S, D)).astype(mx.float16)
         mx.eval(keys, values)
@@ -304,7 +384,7 @@ class TestMLXFoveatedCache:
 
 class TestFusedMetalKernel:
     def _make_cache(self, S=256, H_kv=2, D=64, H_q=8, cfg=None):
-        cfg = cfg or MLXTierConfig(foveal_pct=0.05, periph_pct=0.25)
+        cfg = cfg or MLXTierConfig()
         B = 1
         keys = mx.random.normal((B, H_kv, S, D)).astype(mx.float16)
         values = mx.random.normal((B, H_kv, S, D)).astype(mx.float16)
@@ -316,7 +396,7 @@ class TestFusedMetalKernel:
         return cache, keys, values, query
 
     def test_fused_available(self):
-        from mipmap_kv.metal_foveated import is_available
+        from foveated_kv.metal_foveated import is_available
         assert is_available(), "Metal fused kernel should be available on Apple Silicon"
 
     def test_fused_matches_reference(self):
@@ -364,6 +444,34 @@ class TestFusedMetalKernel:
         assert flags.shape == (1, 8)
         assert tokens.shape == (1, 8)
 
+    def test_fused_bfloat16_inputs(self):
+        """Regression: bfloat16 model inputs must produce correct results.
+
+        Scale/zero arrays from quantization inherit the input dtype. The Metal
+        kernel reads them as float16. If build_blob doesn't normalize to fp16,
+        bfloat16 bits get misinterpreted (different exponent width) and
+        dequantization produces garbage.
+        """
+        B, H_kv, S, D, H_q = 1, 2, 256, 64, 8
+        cfg = MLXTierConfig()
+        keys = mx.random.normal((B, H_kv, S, D)).astype(mx.bfloat16)
+        values = mx.random.normal((B, H_kv, S, D)).astype(mx.bfloat16)
+        query = mx.random.normal((B, H_q, 1, D)).astype(mx.bfloat16)
+        mx.eval(keys, values, query)
+
+        cache = MLXFoveatedKVCache(cfg)
+        cache.update(keys, values, 0)
+        cache.compress()
+
+        # Reference: dequant + SDPA (uses astype internally, always correct)
+        ref_out = cache.attend(0, query)
+        # Fused kernel through C++ blob path
+        fused_out = cache.attend_fused(0, query)
+        mx.eval(ref_out, fused_out)
+
+        cos = _cosine(fused_out, ref_out)
+        assert cos > 0.9999, f"bf16 fused vs reference cosine {cos:.6f} — scale/zero dtype bug?"
+
 
 # --- Standard attention baseline test ---
 
@@ -391,6 +499,143 @@ class TestStandardAttention:
         out = standard_attention_mlx(query, keys, values)
         mx.eval(out)
         assert out.shape == (B, H, 1, D)
+
+
+# --- SDPA fallback tests ---
+
+
+class TestSDPAFallback:
+    """Tests for graceful fallback when the fused Metal kernel fails."""
+
+    def _make_fused_setup(self, S=256, H_kv=2, D=64, H_q=8):
+        from foveated_kv.mlx_generate import (
+            _fused_state,
+            _fused_sdpa_interceptor,
+            install_fused_sdpa,
+            uninstall_fused_sdpa,
+            FusedCacheWrapper,
+        )
+        cfg = MLXTierConfig()
+        keys = mx.random.normal((1, H_kv, S, D)).astype(mx.float16)
+        values = mx.random.normal((1, H_kv, S, D)).astype(mx.float16)
+        mx.eval(keys, values)
+        cache = MLXFoveatedKVCache(cfg)
+        cache.update(keys, values, 0)
+        cache.compress()
+        return cache, _fused_state, install_fused_sdpa, uninstall_fused_sdpa, FusedCacheWrapper
+
+    def test_fallback_on_kernel_failure(self):
+        """Metal kernel exception → falls back to standard SDPA."""
+        cache, state, install, uninstall, Wrapper = self._make_fused_setup()
+        install(cache)
+        try:
+            # Force attend_fused_with_spikes to throw
+            original_method = cache.layers[0].attend_fused_with_spikes
+            cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
+                RuntimeError("Metal kernel failed")
+            )
+
+            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
+            mx.eval(query)
+
+            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
+            out = _fused_sdpa_interceptor(
+                query, query, query, scale=1.0 / (64 ** 0.5), mask=None
+            )
+            mx.eval(out)
+            # Should produce valid output via fallback
+            assert out.shape == (1, 8, 1, 64)
+            cache.layers[0].attend_fused_with_spikes = original_method
+        finally:
+            uninstall()
+
+    def test_permanent_disable_after_failure(self):
+        """After first failure, fused is permanently disabled."""
+        cache, state, install, uninstall, Wrapper = self._make_fused_setup()
+        install(cache)
+        try:
+            original_method = cache.layers[0].attend_fused_with_spikes
+            cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
+                RuntimeError("Metal kernel failed")
+            )
+
+            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
+            mx.eval(query)
+
+            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
+            _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
+            assert state._fused_disabled is True
+
+            # Restore method — should still be disabled
+            cache.layers[0].attend_fused_with_spikes = original_method
+            state._layer_counter = 0
+            out = _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
+            mx.eval(out)
+            assert state._fused_disabled is True
+            assert out.shape == (1, 8, 1, 64)
+        finally:
+            uninstall()
+
+    def test_warning_logged_once(self, caplog):
+        """Warning is logged exactly once on first failure."""
+        import logging
+        cache, state, install, uninstall, Wrapper = self._make_fused_setup()
+        install(cache)
+        try:
+            cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
+                RuntimeError("Metal kernel failed")
+            )
+
+            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
+            mx.eval(query)
+
+            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
+            with caplog.at_level(logging.WARNING, logger="foveated_kv"):
+                # First call — triggers warning
+                _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
+                # Second call — fused already disabled, no new warning
+                state._layer_counter = 0
+                _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
+
+            warning_count = sum(
+                1 for r in caplog.records
+                if "falling back to standard SDPA" in r.message
+            )
+            assert warning_count == 1, f"Expected 1 warning, got {warning_count}"
+        finally:
+            uninstall()
+
+    def test_fallback_produces_correct_output(self):
+        """Fallback output matches standard SDPA exactly."""
+        S, H_kv, D, H_q = 256, 2, 64, 8
+        cache, state, install, uninstall, Wrapper = self._make_fused_setup(
+            S=S, H_kv=H_kv, D=D, H_q=H_q
+        )
+
+        keys = mx.random.normal((1, H_kv, S, D)).astype(mx.float16)
+        values = mx.random.normal((1, H_kv, S, D)).astype(mx.float16)
+        query = mx.random.normal((1, H_q, 1, D)).astype(mx.float16)
+        mx.eval(keys, values, query)
+
+        # Standard SDPA reference
+        ref = state.original_sdpa or mx.fast.scaled_dot_product_attention
+        ref_out = ref(query, keys, values, scale=1.0 / (D ** 0.5))
+        mx.eval(ref_out)
+
+        # Force fallback
+        install(cache)
+        try:
+            state._fused_disabled = True
+            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
+            fb_out = _fused_sdpa_interceptor(
+                query, keys, values, scale=1.0 / (D ** 0.5), mask=None
+            )
+            mx.eval(fb_out)
+        finally:
+            uninstall()
+
+        cos = _cosine(fb_out, ref_out)
+        assert cos > 0.99999, f"Fallback vs standard cosine {cos:.6f}"
 
 
 # --- Helpers ---

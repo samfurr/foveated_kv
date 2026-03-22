@@ -6,7 +6,6 @@ from .mlx_quantize import (
 )
 from .metal_foveated import foveated_attention_metal, is_available as metal_is_available
 from .disk_archive import DiskArchive, create_disk_archive, offload_cache_to_disk
-from .mlx_async_promoter import AsyncPromoter
 
 __all__ = [
     "MLXFoveatedKVCache",
@@ -23,5 +22,4 @@ __all__ = [
     "DiskArchive",
     "create_disk_archive",
     "offload_cache_to_disk",
-    "AsyncPromoter",
 ]

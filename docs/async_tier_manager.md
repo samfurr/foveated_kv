@@ -1,146 +1,98 @@
-# Async Promotion System
+# Promotion Pipeline
 
-Last updated: 2026-03-14
+Last updated: 2026-03-21
 
 ## Architecture
 
-The MLX async promotion system (`mlx_async_promoter.py`) uses 2 background worker
-threads to handle tier management without blocking the main decode loop.
+The promotion system uses a C++ `PromotionPipeline` with one background worker
+thread. It replaces the earlier Python `AsyncPromoter` (2 workers, numpy-only,
+override buffer approach). The C++ pipeline writes promoted tokens directly into
+the blob's near-tier headroom — the kernel sees them as ordinary near tokens on
+the next dispatch.
 
-### Why 2 workers
+### Design
 
-1. **Spike worker**: Processes raw spike events from the Metal kernel. Maps far-local
-   indices to archive indices. Queues promotion updates. Handles the urgent path.
+```
+Metal kernel → spike_flags/tokens (unified memory, free byproduct of softmax)
+  → Python calls pipeline.drain_spikes() once per step per layer
+    → C++ reads data<int32_t>() zero-copy from unified memory
+    → C++ filters: cooldown, dedup, budget, GQA dedup
+    → pushes SpikeRecord into internal deque
+  → C++ worker thread (std::thread):
+    → reads fp16 from POSIX mmap (disk archive)
+    → memcpy into blob near_k/near_v at slot near_valid[h]
+    → atomic increment near_valid[h] in blob
+    → kernel sees new near token on next dispatch — zero overhead
+```
 
-2. **Disk worker**: Reads fp16 originals from NVMe mmap archives. Handles the I/O
-   path separately so spike processing is never blocked by disk reads.
+### Why this replaces override buffers
 
-### Key constraint: no MLX in workers
-
-MLX's computation graph is not thread-safe. All worker threads use **numpy only**.
-MLX operations (updating cache tensors, converting numpy arrays to mx.array) happen
-on the main thread when updates are drained and applied.
-
-This is a hard constraint, not a performance choice.
+The earlier design used 4 extra Metal buffer bindings (override_k/v/idx/count)
+and a merge-scan in the kernel's far loop. Every far token checked against an
+override list, causing branch divergence and register pressure. The near-tier
+headroom approach eliminates all of this — promoted tokens are just near tokens.
 
 ## Unified Memory Advantage
 
 On Apple Silicon, there is no CPU-GPU memory transfer bottleneck:
 
 - No PCIe transfers to schedule or overlap
-- Worker threads access the same physical memory as the GPU
-- Disk mmap archives read directly into numpy arrays
-- Updated tier data is visible to the GPU after mx.array conversion on main thread
-
-This eliminates the entire "layer-spread PCIe transfer" design from the earlier
-architecture. Promotion is: read from disk -> convert on main thread -> done.
+- The blob's backing memory is the same physical memory for CPU and GPU
+- Worker thread writes directly into blob memory via raw pointers
+- Disk mmap archives read directly into the blob
+- `near_valid[h]` increment is the atomic commit point
 
 ## Disk mmap Archives (`disk_archive.py`)
 
-NVMe-backed numpy.memmap files store exact fp16 originals for all non-foveal tokens.
+NVMe-backed numpy.memmap files store exact fp16 originals for all non-near tokens.
 
-- **One file per layer.** Separate mmap files avoid lock contention between layers.
-- **~50us per token read.** NVMe random read latency, not sequential throughput.
-- **Written once after prefill.** New tokens during decode are appended.
+- **Separate K and V files per layer.** Avoids lock contention between layers.
+- **~50us per token read.** NVMe random read latency.
+- **Written once after prefill.** Exact fp16 originals preserved for lossless promotion.
 - **numpy.memmap**: OS handles page caching. Recently accessed regions stay hot.
 
-Archive format:
-```
-archive_layer_0.npy  ->  memmap shape (S, 2, H_kv, D) dtype=float16
-archive_layer_1.npy      [token_idx, 0=key/1=value, head, dim]
-...
-```
+## Thread Safety on Unified Memory
 
-## GPU -> Main Thread Handoff
+The C++ worker writes K,V data into headroom slots, then increments `near_valid[h]`.
+The kernel reads `near_valid[h]` once at the start of each dispatch.
 
-### Fire-and-forget spike handoff
+Safety guarantees:
 
-The Metal kernel writes spike flags and token indices during attention. The main
-thread collects these after each layer's attention call and hands them to the spike
-worker via a simple queue:
+- **No torn reads**: `near_valid[h]` is a `uint32_t` — atomic on ARM64
+- **Ordering**: Worker writes K,V data THEN updates count. ARM64 store-release
+  ensures data is visible before count. Kernel reads count THEN reads K,V data.
+- **No overlap**: Worker writes to slot `near_valid[h]` (unused). Kernel reads
+  slots `0..near_valid[h]-1` (used). Different memory ranges.
+- **No double-buffer needed**: Promotions are additive-only (never overwrite
+  existing near tokens). The count increment is the atomic commit point.
 
-```python
-# Main thread (after Metal kernel returns)
-spikes = collect_spikes(layer_idx)
-if spikes:
-    promoter.submit_spikes(layer_idx, spikes)  # non-blocking
+## Spike Filtering (C++ drain_spikes)
 
-# Later in the same decode step
-updates = promoter.drain(layer_idx)  # O(1) dict lookup
-if updates:
-    apply_updates(cache, layer_idx, updates)  # MLX operations here
-```
+The kernel fires spikes on nearly every head every step (~2000+ raw spikes per
+50 tokens). The C++ `drain_spikes()` filters this down:
 
-### O(1) drain via dict
-
-Ready updates are stored in a dict keyed by layer index. The main thread checks
-for its current layer and applies any pending updates. No scanning, no priority
-queue traversal.
-
-## Worker Model
-
-### Spike worker
-
-```
-Loop:
-  1. Block on spike queue (with timeout)
-  2. Map far-local index -> archive index
-  3. Submit read request to disk worker
-  4. Store pending promotion in ready dict
-```
-
-### Disk worker
-
-```
-Loop:
-  1. Block on read queue (with timeout)
-  2. Read fp16 K,V from mmap archive
-  3. Store result in ready dict (keyed by layer)
-```
-
-Both workers shut down cleanly when signaled. No daemon threads.
-
-## Safe Mutation Points
-
-Updates are applied only on the main thread, only between layer calls:
-
-- After draining updates for a layer
-- Before the next layer's attention call
-- Never during a Metal kernel execution
-
-This is simpler than the earlier design because unified memory eliminates the
-need to overlap PCIe transfers with MLP compute.
+1. **Per-(layer, head) cooldown** — 5-step minimum between spikes on same head
+2. **Position dedup** — never promote same token twice (splitmix64 hash set)
+3. **Budget** — max N promotions per drain call (prevents stalling)
+4. **GQA dedup** — multiple q-heads map to same kv-head, only process once
 
 ## Stats and Instrumentation
 
-The promoter tracks:
-- Spikes submitted
-- Spikes processed
-- Disk reads completed
-- Updates applied
-- Queue depths (current and peak)
+The pipeline tracks:
+- `spikes_detected` — raw count from kernel
+- `spikes_queued` — after filtering, queued for worker
+- `spikes_deduplicated` — rejected by position dedup
+- `spikes_cooled_down` — rejected by cooldown
+- `promotions_completed` — successfully written to blob
+- `promotions_headroom_full` — rejected because near tier is full
 
-These are available via `promoter.stats()` for debugging and benchmarking.
-
-## Comparison with Earlier Design
-
-| Aspect | Earlier (PyTorch/CUDA) | Current (MLX) |
-|--------|----------------------|---------------|
-| Workers | 1 urgent + 1 background | 1 spike + 1 disk |
-| Archive | CPU RAM tensors | NVMe mmap files |
-| Transfer | PCIe GPU<->CPU | None (unified memory) |
-| Worker ops | numpy scoring | numpy only (no MLX) |
-| Update apply | GPU-side at safe points | Main thread mx.array conversion |
-| Handoff | publish_query + publish_spike | fire-and-forget submit_spikes |
-| Drain | drain_ready_updates(layer) | O(1) dict[layer] lookup |
-
-The MLX version is simpler because unified memory removes the transfer scheduling
-problem entirely. The hard constraint is thread safety of MLX's computation graph,
-which is solved by keeping all MLX operations on the main thread.
+Available via `pipeline.get_stats()` as a dict.
 
 ## Implementation
 
-- `src/mipmap_kv/mlx_async_promoter.py` — async promoter with 2 workers
-- `src/mipmap_kv/disk_archive.py` — numpy.memmap archive management
+- `csrc/promotion_pipeline.h` — PromotionPipeline, SpikeRecord, BlobWriteInfo, ArchiveInfo
+- `csrc/promotion_pipeline.cpp` — worker loop, drain_spikes, register_archive/blob
+- `csrc/bindings.cpp` — nanobind bindings for PromotionPipeline
+- `src/foveated_kv/mlx_generate.py` — drain_spikes call in reset_fused_layer_counter()
+- `src/foveated_kv/disk_archive.py` — numpy.memmap archive management
 - `tests/test_disk_archive.py` — 8 tests for archive operations
-- `tests/test_mlx_foveated.py` — MLX cache tests including promotion paths

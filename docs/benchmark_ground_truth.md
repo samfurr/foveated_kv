@@ -1,6 +1,6 @@
 # Benchmark Ground Truth
 
-Last updated: 2026-03-14
+Last updated: 2026-03-21
 
 ## Purpose
 
@@ -44,8 +44,21 @@ Current repo status:
 Current repo status:
 
 - `benchmarks/benchmark_mlx_needle_heatmap.py` runs depth x context grid evaluation
-- Result: 36/36 (100%) across 2K-8K, all depths
+- Result: 55/55 (100%) across 2K-8K, all depths
 - Label: `approximation` (custom prompt generator, not the paper implementation)
+
+### Promotion Recovery (Multi-Fact Retrieval)
+
+- Custom benchmark: `benchmarks/benchmark_promotion_recovery.py`
+- Biographical needle with 4 checkable facts (dates, achievements) buried in filler
+- Tests standard vs foveated+promotion vs foveated-no-promotion
+- Result (0.5B, ~2K context, 5% near, 8 seeds):
+  - Standard: 88% facts retrieved
+  - Foveated + promotion: 88% (matches baseline)
+  - Foveated no promotion: 50%
+  - Promotion recovers 24/64 additional facts (38%)
+- 100% reproducible at depth=0.3 across all seeds
+- Label: `approximation` (custom prompt, custom scoring)
 
 ### KIVI Baseline (PyTorch reference only)
 
@@ -85,7 +98,7 @@ Current repo status:
 All MLX benchmarks (`benchmark_mlx_*.py`) follow this methodology:
 
 1. **Data loading**: JSONL directly from HuggingFace datasets
-2. **Model**: mlx-lm loaded models (e.g., Qwen2.5-0.5B-Instruct-bf16)
+2. **Model**: mlx-lm loaded models (Qwen2.5-0.5B-Instruct-4bit, Qwen2.5-7B-Instruct-4bit)
 3. **Scoring**: Official THUDM scoring functions for LongBench tasks
 4. **Timing**: MLX eval + sync for kernel benchmarks
 5. **Memory**: Actual tensor allocation measurement
@@ -104,3 +117,6 @@ All MLX benchmarks (`benchmark_mlx_*.py`) follow this methodology:
 - Needle retrieval is an approximation (custom prompts, not paper implementation)
 - Kernel speed numbers are synthetic benchmarks with controlled shapes
 - PPL and memory measurements are direct, not estimated
+- 7B end-to-end numbers are on M2 8GB under memory pressure (swap-bound)
+- Promotion recovery is a custom benchmark, reproducible across 8 seeds
+- Fused kernel correctness: cosine 1.000000 vs dequant-reference on 7B shapes

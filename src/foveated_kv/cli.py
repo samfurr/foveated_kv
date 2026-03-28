@@ -20,6 +20,8 @@ def main():
     gen.add_argument("--temp", type=float, default=0.0, help="Sampling temperature (0 = greedy)")
     gen.add_argument("--near-pct", type=float, default=0.10,
                      help="Fraction of tokens kept at full precision (default: 0.10)")
+    gen.add_argument("--compress", type=str, default="fp8", choices=["fp8", "turbo"],
+                     help="Compression method: fp8 (2x, default) or turbo (3.2x TurboQuant)")
     gen.add_argument("--no-promotion", action="store_true", help="Disable spike promotion")
     gen.add_argument("--standard", action="store_true",
                      help="Use standard (non-foveated) cache for baseline comparison")
@@ -77,9 +79,10 @@ def _run_foveated(model, tokenizer, args):
     from .mlx_foveated import MLXTierConfig
     from .mlx_generate import generate_fused
 
-    cfg = MLXTierConfig(near_pct=args.near_pct)
+    cfg = MLXTierConfig(near_pct=args.near_pct, compress_method=args.compress)
+    method_label = "TurboQuant 3.2x" if args.compress == "turbo" else "fp8 2x"
 
-    print(f"Generating with FOVEATED cache (max {args.max_tokens} tokens, temp={args.temp})...\n")
+    print(f"Generating with FOVEATED cache [{method_label}] (max {args.max_tokens} tokens, temp={args.temp})...\n")
 
     text, stats = generate_fused(
         model, tokenizer, args.prompt,
@@ -96,6 +99,7 @@ def _run_foveated(model, tokenizer, args):
     print(f"Prefill time:     {stats['prefill_time_s']:.3f}s")
     print(f"Decode time:      {stats['decode_time_s']:.3f}s")
     print(f"Tokens/sec:       {stats['tokens_per_second']:.1f}")
+    print(f"Compression:      {method_label}")
     print(f"Near tier:        {args.near_pct:.0%} of context at fp16")
     print(f"Memory saved:     {stats['mem_saved_mb']:.1f} MB (disk offload)")
     print(f"Compression:      {stats['mem_quantized_mb']:.1f} MB quantized cache")

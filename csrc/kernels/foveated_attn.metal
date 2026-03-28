@@ -627,15 +627,16 @@ void foveated_2tier_turbo(
     for (uint c = 0; c < CPT; c++)
         q_reg[c] = q_raw[c] * INV_SQRT_D;
 
-    // q_rot[c] = sum_j(q[j] * Pi[j, lane_id*CPT+c]) — unscaled
-    // The full turbo score is multiplied by INV_SQRT_D after dot_turbo_k
-    // to match near/decode tier score scale.
+    // q_rot = q @ Pi^T: q_rot[i] = sum_j q[j] * Pi[i, j]
+    // Pi is row-major (D x D). Row i of Pi dotted with q gives element i.
+    // Each lane holds CPT elements of q starting at lane_id*CPT.
+    // For output element i = lane_id*CPT+c, we need row i of Pi.
     float q_rot[CPT];
     for (uint c = 0; c < CPT; c++) {
         float dot = 0.0f;
-        uint col = lane_id * CPT + c;
+        uint i = lane_id * CPT + c;
         for (uint qc = 0; qc < CPT; qc++)
-            dot += q_raw[qc] * Pi[(lane_id * CPT + qc) * HEAD_DIM + col];
+            dot += q_raw[qc] * Pi[i * HEAD_DIM + lane_id * CPT + qc];
         q_rot[c] = simd_sum(dot);
     }
 

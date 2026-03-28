@@ -287,10 +287,13 @@ void TurboPrimitive::eval_gpu(
     enc.set_bytes(params_, 7);
     enc.set_bytes(blob_offsets_, 8);
 
-    // Pi, S_mat, centroids → buffers 9-11
+    // Pi, S_mat → buffers 9-10 (device memory)
     enc.set_input_array(inputs[3], 9);
     enc.set_input_array(inputs[4], 10);
-    enc.set_input_array(inputs[5], 11);
+
+    // centroids → buffer 11 (constant memory, 4 floats = 16 bytes)
+    const auto& cents = inputs[5];
+    enc.set_bytes(cents.data<float>(), cents.nbytes(), 11);
 
     enc.dispatch_threadgroups(
         MTL::Size(total_bh_q_, 1, 1),

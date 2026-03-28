@@ -262,7 +262,13 @@ foveated-kv generate --prompt "Explain quantum entanglement:" --max-tokens 100
 # Compare against standard baseline
 foveated-kv generate --prompt "Explain quantum entanglement:" --max-tokens 100 --standard
 
-# Custom model and compression
+# TurboQuant (3.2x compression — trades ~10% quality for 60% more memory savings)
+foveated-kv generate --compress turbo --prompt "Summarize this document:" --max-tokens 100
+
+# TurboQuant with more near-tier tokens (better quality at slightly less compression)
+foveated-kv generate --compress turbo --near-pct 0.3 --prompt "What is 2+2?"
+
+# Custom model
 foveated-kv generate --model mlx-community/Qwen2.5-7B-Instruct-4bit \
   --prompt "Hello world" --near-pct 0.05 --max-tokens 50
 ```

@@ -156,25 +156,6 @@ def install_fused_sdpa(fov_cache: MLXFoveatedKVCache) -> None:
     _fused_state._fused_disabled = False
     _fused_state._installed = True
 
-    # Validate kernel once — catch failures here instead of per-dispatch.
-    try:
-        test_layer = next(
-            (l for l in fov_cache.layers if l is not None), None
-        )
-        if test_layer is not None:
-            B = test_layer.near_k.shape[0]
-            H_q = test_layer.near_k.shape[1]
-            D = test_layer.near_k.shape[-1]
-            dummy_q = mx.zeros((B, H_q, 1, D), dtype=mx.float16)
-            test_layer.attend_fused_with_spikes(dummy_q)
-            mx.eval(dummy_q)
-    except Exception:
-        import logging
-        logging.getLogger("foveated_kv").warning(
-            "Fused Metal kernel validation failed — using standard SDPA fallback"
-        )
-        _fused_state._fused_disabled = True
-
     mx.fast.scaled_dot_product_attention = _build_fused_interceptor(_fused_state)
 
 

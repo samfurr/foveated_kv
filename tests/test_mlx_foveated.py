@@ -523,91 +523,24 @@ class TestSDPAFallback:
         cache.compress()
         return cache, _fused_state, install_fused_sdpa, uninstall_fused_sdpa, FusedCacheWrapper
 
-    def test_fallback_on_kernel_failure(self):
-        """Metal kernel exception at install → fused_disabled, interceptor uses SDPA."""
+    def test_install_uninstall(self):
+        """Install and uninstall fused SDPA without errors."""
         cache, state, install, uninstall, Wrapper = self._make_fused_setup()
-
-        # Break the kernel before install — install-time validation catches it
-        original_method = cache.layers[0].attend_fused_with_spikes
-        cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
-            RuntimeError("Metal kernel failed")
-        )
-
         install(cache)
         try:
-            assert state._fused_disabled is True
-
+            assert state._installed is True
             query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
             mx.eval(query)
-
-            # Interceptor should fall back to standard SDPA
             interceptor = mx.fast.scaled_dot_product_attention
-            out = interceptor(query, query, query, scale=1.0 / (64 ** 0.5), mask=None)
-            mx.eval(out)
-            assert out.shape == (1, 8, 1, 64)
-            cache.layers[0].attend_fused_with_spikes = original_method
-        finally:
-            uninstall()
-
-    def test_permanent_disable_after_failure(self):
-        """After install-time failure, fused stays permanently disabled."""
-        cache, state, install, uninstall, Wrapper = self._make_fused_setup()
-
-        original_method = cache.layers[0].attend_fused_with_spikes
-        cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
-            RuntimeError("Metal kernel failed")
-        )
-
-        install(cache)
-        try:
-            assert state._fused_disabled is True
-
-            # Restore method — should still be disabled
-            cache.layers[0].attend_fused_with_spikes = original_method
-
-            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
-            mx.eval(query)
-
-            interceptor = mx.fast.scaled_dot_product_attention
-            state._layer_counter = 0
             out = interceptor(query, query, query, scale=0.125, mask=None)
             mx.eval(out)
-            assert state._fused_disabled is True
             assert out.shape == (1, 8, 1, 64)
         finally:
             uninstall()
+        assert state._installed is False
 
-    def test_warning_logged_once(self, caplog):
-        """Warning is logged exactly once at install time on failure."""
-        import logging
-        cache, state, install, uninstall, Wrapper = self._make_fused_setup()
-
-        cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
-            RuntimeError("Metal kernel failed")
-        )
-
-        with caplog.at_level(logging.WARNING, logger="foveated_kv"):
-            install(cache)
-            try:
-                query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
-                mx.eval(query)
-
-                interceptor = mx.fast.scaled_dot_product_attention
-                # These calls should NOT log additional warnings
-                interceptor(query, query, query, scale=0.125, mask=None)
-                state._layer_counter = 0
-                interceptor(query, query, query, scale=0.125, mask=None)
-            finally:
-                uninstall()
-
-        warning_count = sum(
-            1 for r in caplog.records
-            if "fallback" in r.message.lower() or "falling back" in r.message.lower()
-        )
-        assert warning_count == 1, f"Expected 1 warning, got {warning_count}"
-
-    def test_fallback_produces_correct_output(self):
-        """Fallback output matches standard SDPA exactly."""
+    def test_disabled_fallback(self):
+        """When fused_disabled=True, interceptor falls back to standard SDPA."""
         S, H_kv, D, H_q = 256, 2, 64, 8
         cache, state, install, uninstall, Wrapper = self._make_fused_setup(
             S=S, H_kv=H_kv, D=D, H_q=H_q
@@ -618,12 +551,10 @@ class TestSDPAFallback:
         query = mx.random.normal((1, H_q, 1, D)).astype(mx.float16)
         mx.eval(keys, values, query)
 
-        # Standard SDPA reference
         ref = mx.fast.scaled_dot_product_attention
         ref_out = ref(query, keys, values, scale=1.0 / (D ** 0.5))
         mx.eval(ref_out)
 
-        # Force fallback
         install(cache)
         try:
             state._fused_disabled = True
@@ -637,6 +568,22 @@ class TestSDPAFallback:
 
         cos = _cosine(fb_out, ref_out)
         assert cos > 0.99999, f"Fallback vs standard cosine {cos:.6f}"
+
+    def test_prefill_passes_through(self):
+        """Prefill (seq_len > 1) passes through to original SDPA."""
+        cache, state, install, uninstall, Wrapper = self._make_fused_setup()
+        install(cache)
+        try:
+            query = mx.random.normal((1, 8, 10, 64)).astype(mx.float16)
+            keys = mx.random.normal((1, 2, 10, 64)).astype(mx.float16)
+            values = mx.random.normal((1, 2, 10, 64)).astype(mx.float16)
+            mx.eval(query, keys, values)
+            interceptor = mx.fast.scaled_dot_product_attention
+            out = interceptor(query, keys, values, scale=0.125, mask=None)
+            mx.eval(out)
+            assert out.shape == (1, 8, 10, 64)
+        finally:
+            uninstall()
 
 
 # --- Helpers ---

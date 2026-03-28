@@ -69,38 +69,19 @@ This lets one `.metallib` serve all tier configurations. Pipeline
 specialization happens at `get_kernel` time via `MTLFCList`, same as
 SDPA.
 
-### 2. Static Buffer Bypass (Eliminates Input Validation)
+### 2. Blob as Tracked Input Array (Correct Dependency Tracking)
 
-`CustomKernel::eval_gpu` iterates all inputs checking contiguity and
-binding buffers through `set_input_array` (which does dependency
-tracking against the command encoder's output set).
+The original plan was to bypass `set_input_array` for static tier arrays
+by using raw `set_buffer` with `MTL::Buffer*` pointers. In practice,
+the blob is now passed as a tracked input array via `set_input_array`
+to ensure correct MLX graph dependency tracking. This is simpler and
+avoids subtle bugs with buffer lifetime management.
 
-The fix: the 7 static tier arrays (near_k, near_v, far_k, far_v,
-far_v_scale, far_v_zero, near_valid) never change after compression.
-Bind them via `set_buffer` using their raw `MTL::Buffer*` pointer,
-extracted once at construction:
+The 7 static tier arrays (near_k, near_v, far_k, far_v, far_v_scale,
+far_v_zero, near_valid) are pre-packed into a single uint8 blob at
+compression time. The blob is passed to `FoveatedPrimitive` as an input
+array alongside the 3 dynamic inputs (query, decode_k, decode_v).
 
-```cpp
-// In FoveatedPrimitive constructor (once):
-for (auto& arr : static_arrays) {
-    static_bufs_.push_back(static_cast<const MTL::Buffer*>(arr.buffer().ptr()));
-    static_offsets_.push_back(arr.offset());
-}
-
-// In eval_gpu (every call):
-for (int i = 0; i < 7; i++)
-    enc.set_buffer(static_bufs_[i], buffer_idx + i, static_offsets_[i]);
-```
-
-Critical detail from the research: `buffer().ptr()` returns the
-`MTL::Buffer*`. Our earlier attempt used `buffer().raw_ptr()` which
-returns the data address — wrong level of indirection. This is confirmed
-in MLX's allocator source where the Metal buffer is obtained via
-`static_cast<MTL::Buffer*>(buffer.ptr())`.
-
-Only the 3 dynamic inputs (query, decode_k, decode_v) go through
-`set_input_array` for proper dependency tracking. The statics have no
-dependencies — they were evaluated during compression and never change.
 Override buffers have been eliminated; promotions go directly into the
 blob's near-tier headroom via the C++ PromotionPipeline.
 
@@ -150,13 +131,9 @@ void FoveatedPrimitive::eval_gpu(
     auto kernel = d.get_kernel(kernel_name_, metallib_, hash_name_, func_consts_);
     enc.set_compute_pipeline_state(kernel);
 
-    // Static tier arrays — raw Metal buffer binding, no graph tracking
-    for (int i = 0; i < n_static_; i++)
-        enc.set_buffer(static_bufs_[i], i, static_offsets_[i]);
-
-    // Dynamic inputs — standard set_input_array for dependency tracking
-    // inputs[0]: query, [1]: decode_k, [2]: decode_v
-    int idx = n_static_;
+    // All inputs — tracked via set_input_array for dependency tracking
+    // inputs[0]: blob (packed statics), [1]: query, [2]: decode_k, [3]: decode_v
+    int idx = 0;
     for (int i = 0; i < inputs.size(); i++)
         enc.set_input_array(inputs[i], idx++);
 
@@ -244,23 +221,43 @@ at runtime. No source strings stored in memory.
 |-----------------------|-------------------|
 | 10KB source string comparison per call | None (precompiled metallib) |
 | Hash map lookup with shared_lock | Direct pointer to cached pipeline |
-| Contiguity check loop (N inputs) | Static bufs bypass graph; 7 dynamic only |
+| Contiguity check loop (N inputs) | Blob packs 7 statics into 1; only 4 inputs total |
 | Shape/stride/ndim conditional binding | Not used (no shape_infos) |
 | dispatch_threads | dispatch_threadgroups |
 | Lambda construction for builder | None (path-based library load) |
 | checked_inputs vector allocation | No intermediate vector |
 
-## Expected Outcome
+## Actual Outcome
 
-The per-layer dispatch overhead should drop from ~5ms (CustomKernel) to
-~1ms (matching SDPA). Over 24 layers, that is 96ms saved — bringing
-end-to-end decode from ~130ms to ~35ms on the 0.5B model.
+The dispatch overhead optimizations, combined with fixing a dtype mismatch
+(fp16 cache vs bf16 model) and replacing the SDPA monkey-patch with direct
+attention module patching (`install_fused_attention`), eliminated the
+end-to-end slowdown entirely:
 
-At that point, the fused kernel adds approximately 5ms of total overhead
-over standard SDPA (from the 7 dynamic input bindings + runtime params).
-The remaining comparison is pure GPU compute: our merged kernel reading
-fp8/INT4 vs SDPA reading fp16. Break-even at short context, bandwidth
-wins at long context.
+**End-to-end decode performance (tok/s):**
+
+| Model | Fused | Standard | Speedup |
+|-------|-------|----------|---------|
+| 4-bit (Qwen2.5-7B-Instruct-4bit) | 150 tok/s | 130-146 tok/s | 1.03-1.45x |
+| bf16 (Qwen2.5-0.5B-Instruct-bf16) | 67-69 tok/s | 60-66 tok/s | 1.04-1.14x |
+
+**Kernel microbenchmarks (7B shapes):**
+
+| Context | fp16 SDPA | Fused | Speedup |
+|---------|-----------|-------|---------|
+| 1K | 0.84 ms | 1.00 ms | 0.84x |
+| 4K | 2.07 ms | 1.20 ms | 1.72x |
+| 8K | 4.15 ms | 1.68 ms | 2.47x |
+| 16K | 9.67 ms | 2.90 ms | 3.34x |
+| 32K | 15.19 ms | 5.18 ms | 2.93x |
+
+Key changes that unlocked the speedup:
+- Direct attention module patching replaced SDPA monkey-patch (eliminates interceptor overhead)
+- Blob passed as tracked input array (`set_input_array`) instead of raw pointer (`set_buffer`)
+- Lazy decode buffer concatenation (flat list + lazy concat vs O(n) chained concat)
+- Closure-based interceptor for fallback path
+- Conditional `astype` in C++ to skip no-op dtype casts
+- Fixed dtype mismatch: fp16 cache vs bf16 model was causing silent conversion overhead
 
 ## Phases
 
@@ -271,7 +268,7 @@ wins at long context.
 | 3 | Metal function constants for tier specialization | **Done** |
 | 4 | Benchmark: verify dispatch overhead reduction | **Done** |
 | 5 | Remove old CustomKernel path, make FoveatedPrimitive the sole pipeline | **Done** |
-| 6 | End-to-end validation on 0.5B + larger models | Pending |
+| 6 | End-to-end validation on 0.5B + larger models | **Done** |
 
 The old CustomKernel path (fast::metal_kernel) has been removed. The C++
 extension now uses FoveatedPrimitive exclusively. The Python Metal kernel

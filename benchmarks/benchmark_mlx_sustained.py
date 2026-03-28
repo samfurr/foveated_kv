@@ -31,9 +31,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from foveated_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
 from foveated_kv.mlx_generate import (
     FusedCacheWrapper,
-    install_fused_sdpa,
-    uninstall_fused_sdpa,
-    reset_fused_layer_counter,
+    install_fused_attention,
+    uninstall_fused_attention,
+    drain_spikes,
     prefill_and_compress,
     _generate_short,
 )
@@ -133,7 +133,7 @@ def generate_with_logit_trace(
         generated.append(token_id)
 
         if fused:
-            reset_fused_layer_counter()
+            drain_spikes(cache, None, step)
 
         next_input = next_token.reshape(1, 1)
         next_logits = model(next_input, cache=cache)
@@ -217,11 +217,7 @@ def main():
     print("\n[2/3] Frozen tiers (no promotion)...")
     tokens_mx = mx.array(tokenizer.encode(prompt)).reshape(1, -1)
     fov_cache_frozen, frozen_prefill_logits, _ = prefill_and_compress(model, tokens_mx, cfg)
-    frozen_wrappers = [
-        FusedCacheWrapper(layer, i) if layer is not None else None
-        for i, layer in enumerate(fov_cache_frozen.layers)
-    ]
-    install_fused_sdpa(fov_cache_frozen)
+    frozen_wrappers = install_fused_attention(model, fov_cache_frozen)
 
     t0 = time.perf_counter()
     frozen_tokens, frozen_trace = generate_with_logit_trace(
@@ -231,7 +227,7 @@ def main():
         fused=True,
     )
     frozen_time = time.perf_counter() - t0
-    uninstall_fused_sdpa()
+    uninstall_fused_attention(model)
     frozen_text = tokenizer.decode(frozen_tokens)
     frozen_found = passkey in frozen_text
     print(f"  {len(frozen_tokens)} tokens in {frozen_time:.1f}s | passkey: {'YES' if frozen_found else 'NO'}")
@@ -267,14 +263,7 @@ def main():
                 archive.H_kv, archive.S_arc, archive.D,
                 archive_idx)
 
-    promo_wrappers = [
-        FusedCacheWrapper(layer, i) if layer is not None else None
-        for i, layer in enumerate(fov_cache_promo.layers)
-    ]
-    install_fused_sdpa(fov_cache_promo)
-    from foveated_kv.mlx_generate import _fused_state
-    _fused_state._fused_wrappers = promo_wrappers
-    _fused_state._cpp_pipeline_handle = cpp_pipeline
+    promo_wrappers = install_fused_attention(model, fov_cache_promo)
 
     t0 = time.perf_counter()
     promo_tokens, promo_trace = generate_with_logit_trace(
@@ -284,7 +273,7 @@ def main():
         fused=True,
     )
     promo_time = time.perf_counter() - t0
-    uninstall_fused_sdpa()
+    uninstall_fused_attention(model)
     promo_text = tokenizer.decode(promo_tokens)
     promo_found = passkey in promo_text
     promo_stats = cpp_pipeline.get_stats()

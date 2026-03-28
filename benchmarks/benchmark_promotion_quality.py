@@ -36,11 +36,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from foveated_kv.mlx_foveated import MLXFoveatedKVCache, MLXTierConfig
 from foveated_kv.mlx_generate import (
     FusedCacheWrapper,
-    install_fused_sdpa,
-    uninstall_fused_sdpa,
-    reset_fused_layer_counter,
+    install_fused_attention,
+    uninstall_fused_attention,
+    drain_spikes,
     prefill_and_compress,
-    _fused_state,
 )
 from foveated_kv.disk_archive import offload_cache_to_disk
 
@@ -78,7 +77,8 @@ def build_passkey_prompt(tokenizer, context_len: int, depth: float, passkey: str
     return tokenizer.decode(tokens)
 
 
-def generate_short(model, tokenizer, cache_wrappers, prefill_logits, max_tokens=20):
+def generate_short(model, tokenizer, cache_wrappers, prefill_logits,
+                   max_tokens=20, pipeline=None):
     """Generate tokens using fused kernel. Returns token list."""
     gen = []
     logits = prefill_logits[:, -1, :]
@@ -91,24 +91,17 @@ def generate_short(model, tokenizer, cache_wrappers, prefill_logits, max_tokens=
         if tok_id == tokenizer.eos_token_id:
             break
         gen.append(tok_id)
-        reset_fused_layer_counter()
+        drain_spikes(cache_wrappers, pipeline, step)
         logits = model(tok.reshape(1, 1), cache=cache_wrappers)[:, -1, :]
     return gen
 
 
 def run_frozen(model, tokenizer, tokens, cfg, max_tokens=20):
-    """Fused kernel, frozen tiers (no overrides)."""
+    """Fused kernel, frozen tiers (no promotion)."""
     fov_cache, prefill_logits, _ = prefill_and_compress(model, tokens, cfg)
-
-    wrappers = [
-        FusedCacheWrapper(l, i) if l else None
-        for i, l in enumerate(fov_cache.layers)
-    ]
-    install_fused_sdpa(fov_cache)
-    _fused_state._fused_wrappers = wrappers  # enable counter reset
-
+    wrappers = install_fused_attention(model, fov_cache)
     gen = generate_short(model, tokenizer, wrappers, prefill_logits, max_tokens)
-    uninstall_fused_sdpa()
+    uninstall_fused_attention(model)
     return gen
 
 
@@ -141,19 +134,13 @@ def run_promoted(model, tokenizer, tokens, cfg, max_tokens=20):
                     archive.H_kv, archive.S_arc, archive.D,
                     archive_idx)
 
-        wrappers = [
-            FusedCacheWrapper(l, i) if l else None
-            for i, l in enumerate(fov_cache.layers)
-        ]
-        install_fused_sdpa(fov_cache)
-        _fused_state._fused_wrappers = wrappers
-        _fused_state._cpp_pipeline_handle = cpp_pipeline
-
-        gen = generate_short(model, tokenizer, wrappers, prefill_logits, max_tokens)
+        wrappers = install_fused_attention(model, fov_cache)
+        gen = generate_short(model, tokenizer, wrappers, prefill_logits,
+                           max_tokens, pipeline=cpp_pipeline)
 
         stats = cpp_pipeline.get_stats()
         cpp_pipeline.stop()
-        uninstall_fused_sdpa()
+        uninstall_fused_attention(model)
         return gen, stats
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

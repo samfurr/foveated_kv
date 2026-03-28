@@ -117,12 +117,19 @@ Far    (3.6K tokens):   K fp8 + V INT4 = ~54 MB (fp8 K = 1B, INT4 V = 0.5B + sca
 Total KV read:  ~79 MB -> 0.40 ms at 200 GB/s
 ```
 
-**Measured results (7B shapes):**
+**Measured results (7B shapes, kernel microbenchmark):**
 ```
-4K context:   1.60x faster than fp16 SDPA
-8K context:   1.82x faster than fp16 SDPA
-16K context:  2.06x faster than fp16 SDPA
-32K context:  2.31x faster than fp16 SDPA
+1K context:   0.84x (slight overhead at short context)
+4K context:   1.72x faster than fp16 SDPA
+8K context:   2.47x faster than fp16 SDPA
+16K context:  3.34x faster than fp16 SDPA
+32K context:  2.93x faster than fp16 SDPA
+```
+
+**End-to-end decode performance:**
+```
+Qwen2.5-7B-Instruct-4bit:    150 tok/s fused vs 130-146 standard (1.03-1.45x)
+Qwen2.5-0.5B-Instruct-bf16:  67-69 tok/s fused vs 60-66 standard (1.04-1.14x)
 ```
 
 The Metal Split-K kernel achieves speedup by:

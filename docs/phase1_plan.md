@@ -1,5 +1,9 @@
 # Development History
 
+> **Note**: This document is primarily historical. For current project state,
+> see `docs/build_plan.md` (architecture and performance) and `docs/cleanup_plan.md`
+> (claim register).
+
 ## Overview
 
 FoveatedKV started as a CUDA/A100 project, validated quality on cloud GPUs, then
@@ -61,11 +65,11 @@ Rebuilt the entire system natively on MLX with custom Metal GPU kernels.
 7. **Full benchmark suite**: LongBench-Lite, needle heatmap, ablation, throughput,
    promotion quality, sustained accuracy.
 
-## Phase 3: C++ Extension + Promotion Pipeline (Current)
+## Phase 3: C++ Extension + Promotion Pipeline
 
-Results on 8GB Mac (kernel-only, 7B shapes, 100 iters):
+Results on 8GB Mac (kernel-only, 7B shapes):
 
-- Kernel: up to 2.31x faster at 32K vs Apple SDPA
+- Kernel: up to 3.34x faster at 16K vs Apple SDPA
 - Quality: 0.995+ cosine, 2.02x compression, PPL ratio 0.999-1.025x
 - C++ extension: nanobind FoveatedHandle with blob-packed statics
 - FoveatedPrimitive: subclasses mlx::core::Primitive, precompiled metallib
@@ -73,7 +77,33 @@ Results on 8GB Mac (kernel-only, 7B shapes, 100 iters):
 - C++ PromotionPipeline: reads fp16 from disk mmap, writes into blob
   near-tier headroom, atomic near_valid[h] commit
 - C++ CompressHandle: GPU compression kernels for fp8 E4M3 K + INT4 V
-- 69 tests passing
+
+## Phase 4: Performance Optimization + TurboQuant (Current)
+
+End-to-end decode went from 3-5x SLOWER than standard to 1.03-1.45x FASTER:
+
+- 4-bit model (Qwen2.5-7B-Instruct-4bit): 150 tok/s fused vs 130-146 standard
+- bf16 model (Qwen2.5-0.5B-Instruct-bf16): 67-69 tok/s fused vs 60-66 standard
+
+Root causes of old slowdown (all fixed):
+- Dtype mismatch: fp16 cache vs bf16 model causing silent conversion overhead
+- SDPA interceptor overhead from monkey-patching
+- O(n) chained concatenation in decode buffer
+
+Architecture changes:
+- Direct attention module patching (`install_fused_attention`) replaced SDPA monkey-patch
+- Blob passed as tracked input array (`set_input_array`) instead of raw pointer
+- Lazy decode buffer concatenation (flat list + lazy concat)
+- Closure-based interceptor for fallback path
+- Conditional `astype` in C++ to skip no-op dtype casts
+
+TurboQuant added as optional compression (`compress_method="turbo"`):
+- 3.25-bit keys (Lloyd-Max + QJL) + 2-bit values = ~4x compression
+- Python path works, Metal kernel has accuracy bug (known issue)
+- New files: `turbo_constants.py`, `turbo_quantize.py`
+- nanobind pinned at 2.10.2 for ABI compatibility with MLX
+
+97 tests passing (was 73), including 24 TurboQuant tests
 
 ## What the PyTorch Code Still Does
 

@@ -201,68 +201,52 @@ def uninstall_fused_sdpa() -> None:
 
 
 def install_fused_attention(model, fov_cache: MLXFoveatedKVCache) -> list:
-    """Patch each attention module to call the fused kernel directly.
+    """Install fused SDPA interceptor with spike stashing.
 
-    Instead of intercepting mx.fast.scaled_dot_product_attention globally,
-    this replaces each layer's attention __call__ with a version that routes
-    decode (seq_len=1) through the fused Metal kernel. No layer counter,
-    no state management, no SDPA monkey-patch.
+    Uses the closure-based SDPA interceptor for zero-overhead decode.
+    Spike flags/tokens are stashed on wrappers for the promotion pipeline.
 
     Returns a list of FusedCacheWrapper objects for use as the cache arg.
     """
-    import types
-
-    original_sdpa = mx.fast.scaled_dot_product_attention
     layers = fov_cache.layers
-    wrappers = []
+    wrappers = [
+        FusedCacheWrapper(layer, i) if layer is not None else None
+        for i, layer in enumerate(layers)
+    ]
 
-    for layer_idx, mlx_layer in enumerate(model.model.layers):
-        fov_layer = layers[layer_idx]
-        wrapper = FusedCacheWrapper(fov_layer, layer_idx) if fov_layer else None
-        wrappers.append(wrapper)
-
-        if fov_layer is None:
-            continue
-
-        attn = mlx_layer.self_attn
-        scale = attn.scale
-
-        def _make_fused_call(fov_l, sc):
-            def _fused_call(self, x, mask=None, cache=None):
-                B, L, D = x.shape
-                queries = self.q_proj(x)
-                keys = self.k_proj(x)
-                values = self.v_proj(x)
-                queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-                keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-                values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-                if cache is not None:
-                    queries = self.rope(queries, offset=cache.offset)
-                    keys = self.rope(keys, offset=cache.offset)
-                    keys, values = cache.update_and_fetch(keys, values)
-                if L == 1 and cache is not None:
-                    output, _, _ = fov_l.attend_fused_with_spikes(queries)
-                    if output.dtype != queries.dtype:
-                        output = output.astype(queries.dtype)
-                else:
-                    output = original_sdpa(
-                        queries, keys, values, scale=sc, mask=mask
-                    )
-                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-                return self.o_proj(output)
-            return _fused_call
-
-        attn.__call__ = types.MethodType(_make_fused_call(fov_layer, scale), attn)
+    install_fused_sdpa(fov_cache)
+    _fused_state._fused_wrappers = wrappers
 
     return wrappers
 
 
 def uninstall_fused_attention(model) -> None:
-    """Remove per-instance attention patches, restoring original __call__."""
-    for mlx_layer in model.model.layers:
-        attn = mlx_layer.self_attn
-        if "__call__" in attn.__dict__:
-            del attn.__call__
+    """Restore original SDPA and clear fused state."""
+    uninstall_fused_sdpa()
+
+
+def drain_spikes(wrappers: list, pipeline, decode_step: int) -> None:
+    """Reset layer counter and drain spikes into the C++ promotion pipeline.
+
+    Called once per decode step, after mx.eval(logits) has materialized
+    the spike arrays. Resets the SDPA interceptor layer counter and
+    drains spike data into the promotion pipeline.
+    """
+    reset_fused_layer_counter()
+
+    if pipeline is None:
+        return
+    for w in wrappers:
+        if w is None:
+            continue
+        flags = w._spike_flags
+        tokens = w._spike_tokens
+        if flags is not None and tokens is not None:
+            pipeline.drain_spikes(
+                w.layer_idx, flags, tokens,
+                w.fov_layer.far_idx, decode_step)
+        w._spike_flags = None
+        w._spike_tokens = None
 
 
 def reset_fused_layer_counter() -> None:
@@ -365,14 +349,8 @@ def generate_fused(
                     archive.H_kv, archive.S_arc, archive.D,
                     archive_idx)
 
-    # 4. Wrap layers + install interceptor
-    fused_wrappers = [
-        FusedCacheWrapper(layer, i) if layer is not None else None
-        for i, layer in enumerate(fov_cache.layers)
-    ]
-    install_fused_sdpa(fov_cache)
-    _fused_state._fused_wrappers = fused_wrappers
-    _fused_state._cpp_pipeline_handle = cpp_pipeline
+    # 4. Patch attention modules directly (zero-overhead decode path)
+    fused_wrappers = install_fused_attention(model, fov_cache)
 
     # 5. Decode loop
     generated = []
@@ -391,7 +369,8 @@ def generate_fused(
                 break
             generated.append(token_id)
 
-            reset_fused_layer_counter()
+            # Drain spikes from previous step (after eval materializes them)
+            drain_spikes(fused_wrappers, cpp_pipeline, step)
 
             next_input = next_token.reshape(1, 1)
             next_logits = model(next_input, cache=fused_wrappers)
@@ -399,7 +378,7 @@ def generate_fused(
             mx.eval(next_logits)
 
     finally:
-        uninstall_fused_sdpa()
+        uninstall_fused_attention(model)
         if cpp_pipeline is not None:
             cpp_pipeline.stop()
         import shutil

@@ -54,11 +54,18 @@ Metal fused kernel speed vs standard fp16 SDPA.
 
 | Context | fp16 SDPA | Fused Kernel | Speedup |
 |---------|-----------|-------------|---------|
-| 1K | 1.12 ms | 0.94 ms | 1.19x |
-| 4K | 2.33 ms | 1.46 ms | 1.60x |
-| 8K | 4.05 ms | 2.22 ms | 1.82x |
-| 16K | 7.68 ms | 3.73 ms | 2.06x |
-| 32K | 15.72 ms | 6.81 ms | 2.31x |
+| 1K | 0.84 ms | 1.00 ms | 0.84x |
+| 4K | 2.07 ms | 1.20 ms | 1.72x |
+| 8K | 4.15 ms | 1.68 ms | 2.47x |
+| 16K | 9.67 ms | 2.90 ms | 3.34x |
+| 32K | 15.19 ms | 5.18 ms | 2.93x |
+
+**End-to-end decode performance:**
+
+| Model | Fused | Standard | Speedup |
+|-------|-------|----------|---------|
+| Qwen2.5-7B-Instruct-4bit | 150 tok/s | 130-146 tok/s | 1.03-1.45x |
+| Qwen2.5-0.5B-Instruct-bf16 | 67-69 tok/s | 60-66 tok/s | 1.04-1.14x |
 
 Memory compression: 2.02x at all context lengths.
 

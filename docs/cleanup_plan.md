@@ -1,6 +1,6 @@
 # FoveatedKV Claim Register
 
-Last updated: 2026-03-21
+Last updated: 2026-03-28
 
 ## Goal
 
@@ -26,14 +26,18 @@ Every meaningful claim maps to working code, tests, and current results.
 | Spike detection piggybacked on kernel softmax | `implemented` | Metal kernel spike_flags/tokens output |
 | Lossless promotion via NVMe disk archive | `implemented` | `disk_archive.py`, 8 tests |
 | C++ promotion pipeline with near-tier headroom | `implemented` | `promotion_pipeline.cpp`, blob write + atomic near_valid |
-| SDPA monkey-patch for mlx-lm | `implemented` | `mlx_generate.py`, FusedCacheWrapper |
+| Direct attention module patching (install_fused_attention) | `implemented` | `mlx_generate.py`, FusedCacheWrapper |
 | MLX quantization (fp8 E4M3 + INT4) | `implemented` | `mlx_quantize.py`, tests in `test_mlx_foveated.py` |
 | C++ GPU compression kernels | `implemented` | `foveated_compress.cpp`, `foveated_compress.metal` |
 | 2.02x memory compression | `implemented` | `benchmark_mlx_throughput.py` results |
 | LongBench-Lite 15.1 vs 14.9 standard | `implemented` | `benchmark_mlx_longbench.py` |
 | 100% needle retrieval (55/55) | `implemented` | `benchmark_mlx_needle_heatmap.py` results |
 | Non-accumulating PPL (0.999-1.025x) | `implemented` | `benchmark_mlx_ablation.py` results |
-| Kernel up to 2.31x at 32K (7B shapes) | `implemented` | `benchmark_mlx_throughput.py` results |
+| Kernel up to 3.34x at 16K (7B shapes) | `implemented` | `benchmark_mlx_throughput.py` results |
+| End-to-end decode 1.03-1.45x faster (4-bit 7B) | `implemented` | `benchmark_mlx_model.py` results |
+| End-to-end decode 1.04-1.14x faster (bf16 0.5B) | `implemented` | `benchmark_mlx_model.py` results |
+| TurboQuant ~4x compression (Python path) | `implemented` | `turbo_quantize.py`, 24 tests |
+| TurboQuant Metal kernel | `partial` | Known accuracy bug in Metal path |
 | Asymmetric K/V is critical (3.6x ablation) | `implemented` | `benchmark_mlx_ablation.py` results |
 | PyTorch reference path for validation | `implemented` | `foveated.py`, `quantize.py`, `patch.py` |
 | KIVI baseline (faithful reimplementation) | `implemented` | `baselines.py`, PyTorch-only |
@@ -41,7 +45,8 @@ Every meaningful claim maps to working code, tests, and current results.
 | LongBench scoring matches THUDM v1 | `implemented` | 29 tests in `test_longbench_scoring.py` |
 | Scaling to larger models (7B+) | `planned` | Architecture supports it; needs higher-end hardware |
 | Longer context (16K-32K real models) | `planned` | Kernel supports it; needs memory for model + cache |
-| Paper write-up | `planned` | Results collected; write-up not started |
+| nanobind pinned at 2.10.2 | `implemented` | `pyproject.toml`, ABI compatibility with MLX |
+| Paper write-up | `partial` | Draft exists in `paper/` directory |
 
 ## Working Rules
 
@@ -51,12 +56,13 @@ Every meaningful claim maps to working code, tests, and current results.
 4. MLX results must be reproducible on the stated hardware.
 5. Baselines are PyTorch-only and cited for comparison context, not direct MLX comparison.
 
-## 69 Tests Passing
+## 97 Tests Passing
 
 - 26 MLX tests (`test_mlx_foveated.py`)
 - 8 disk archive tests (`test_disk_archive.py`)
 - 29 scoring tests (`test_longbench_scoring.py`)
-- 6 other tests
+- 24 TurboQuant tests
+- 10 other tests
 
 ## File Inventory
 
@@ -67,8 +73,10 @@ Every meaningful claim maps to working code, tests, and current results.
 | `mlx_foveated.py` | 2-tier KV cache + decode buffer | 26 in test_mlx_foveated.py |
 | `mlx_quantize.py` | fp8 E4M3 K + INT4 V quantization | covered in test_mlx_foveated.py |
 | `metal_foveated.py` | Python Metal kernel (fallback) | benchmark_mlx.py |
-| `mlx_generate.py` | mlx-lm SDPA monkey-patch + C++ pipeline drain | integration coverage |
+| `mlx_generate.py` | Direct attention module patching + C++ pipeline drain | integration coverage |
 | `disk_archive.py` | NVMe mmap archive | 8 in test_disk_archive.py |
+| `turbo_quantize.py` | TurboQuant: 3.25-bit K + 2-bit V (~4x compression) | 24 TurboQuant tests |
+| `turbo_constants.py` | Pre-computed Lloyd-Max codebooks for TurboQuant | covered in TurboQuant tests |
 
 ### C++ Extension
 

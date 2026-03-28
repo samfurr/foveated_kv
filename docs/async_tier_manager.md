@@ -1,6 +1,6 @@
 # Promotion Pipeline
 
-Last updated: 2026-03-21
+Last updated: 2026-03-28
 
 ## Architecture
 

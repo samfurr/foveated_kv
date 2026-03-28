@@ -86,8 +86,8 @@ def run_model_crossover(contexts, iters=10):
     """End-to-end: full model with interceptor overhead."""
     from mlx_lm import load
     from foveated_kv.mlx_generate import (
-        FusedCacheWrapper, install_fused_sdpa, uninstall_fused_sdpa,
-        reset_fused_layer_counter, prefill_and_compress, _fused_state,
+        FusedCacheWrapper, install_fused_attention, uninstall_fused_attention,
+        drain_spikes, prefill_and_compress,
     )
     from mlx_lm.models.cache import make_prompt_cache
 
@@ -118,13 +118,12 @@ def run_model_crossover(contexts, iters=10):
 
         # Fused
         fov, pl, _ = prefill_and_compress(model, tokens, cfg)
-        wr = [FusedCacheWrapper(l, i) if l else None for i, l in enumerate(fov.layers)]
-        install_fused_sdpa(fov); _fused_state._fused_wrappers = wr
-        for _ in range(3): reset_fused_layer_counter(); out = model(tok, cache=wr); mx.eval(out)
+        wr = install_fused_attention(model, fov)
+        for _ in range(3): drain_spikes(wr, None, 0); out = model(tok, cache=wr); mx.eval(out)
         t0 = time.perf_counter()
-        for _ in range(iters): reset_fused_layer_counter(); out = model(tok, cache=wr); mx.eval(out)
+        for _ in range(iters): drain_spikes(wr, None, 0); out = model(tok, cache=wr); mx.eval(out)
         fused_ms = (time.perf_counter() - t0) / iters * 1000
-        uninstall_fused_sdpa()
+        uninstall_fused_attention(model)
 
         ratio = fused_ms / std_ms
         winner = "FUSED" if ratio < 1.0 else "std"

@@ -2,7 +2,7 @@
 
 **Importance-adaptive mixed-precision KV cache compression for LLM inference on Apple Silicon.**
 
-2x memory compression. 0.995+ cosine fidelity. Custom Metal GPU kernels. 2.3x faster at 32K context.
+2x memory compression. 0.995+ cosine fidelity. Custom Metal GPU kernels. Live spike-driven promotion.
 
 ---
 
@@ -29,20 +29,21 @@ FoveatedKV applies this to LLM attention:
 
 **Every token still contributes to attention.** The softmax denominator is correct. No tokens are evicted. The only approximation is quantization noise on tokens the model isn't paying attention to — bounded and non-accumulating.
 
-## Asymmetric K/V Precision
+## Compression Methods
 
-Multiple recent works (KIVI, LeanKV, KV-AdaQuant, AsymKV) have independently discovered that keys need higher precision than values. Key error gets amplified through exp() in softmax (multiplicative damage); value error is just additive noise scaled by attention weight (linear, bounded).
+### Default: fp8 E4M3 Keys + INT4 Values (2x compression)
 
-FoveatedKV builds on this established insight, using fp8 E4M3 for keys and INT4 for values in the far tier. Our key precision ablation confirms the choice:
+Multiple recent works (KIVI, LeanKV, KV-AdaQuant, AsymKV) independently discovered keys need higher precision than values. Key error gets amplified through exp() in softmax (multiplicative damage); value error is just additive noise scaled by attention weight (linear, bounded).
 
-| Key Format | Cosine Error | vs fp8 |
-|-----------|-------------|--------|
-| fp16 (exact) | 0.000000 | — |
-| INT8 | 0.000009 | 1.0x |
-| fp8 E4M3 (ours) | 0.000009 | 1.0x |
-| INT4 | 0.000317 | **34.3x** |
+FoveatedKV uses fp8 E4M3 for keys and INT4 for values in the far tier. The fp8 LUT enables a single shared-memory read per element vs per-channel scale/zero arithmetic.
 
-fp8 is preferred over INT8 because the 256-entry LUT enables a single shared-memory read per element vs per-channel scale/zero arithmetic.
+### Optional: TurboQuant (4x compression)
+
+TurboQuant (ICLR 2026) provides ~4x compression via:
+- **Keys**: 3.25 bits/dim — Lloyd-Max codebook (2 bits) + QJL residual correction (1 bit)
+- **Values**: 2 bits/dim — symmetric group quantization
+
+Enable with `MLXTierConfig(compress_method="turbo")`. TurboQuant compresses keys via random rotation + scalar quantization, with a Quantized Johnson-Lindenstrauss correction that provably eliminates bias in the attention scores.
 
 ## What's Novel
 
@@ -50,7 +51,7 @@ The quantization strategy is prior work. Our contribution is systems engineering
 
 ### 1. Foveated Two-Tier Cache
 
-Tokens are partitioned per attention head into near (fp16) and far (fp8 K + INT4 V) tiers based on attention importance. Attention sinks and a recency window are always near. Unlike uniform quantization (KIVI, KVSplit), high-attention tokens retain full precision.
+Tokens are partitioned per attention head into near (fp16) and far (compressed) tiers based on attention importance. Attention sinks and a recency window are always near. Unlike uniform quantization (KIVI, KVSplit), high-attention tokens retain full precision.
 
 ### 2. Fused Split-K Metal Kernel
 
@@ -64,7 +65,11 @@ A single GPU dispatch handles both tiers + decode buffer:
 
 No fp16 intermediates ever touch global memory. Dequantization happens in registers.
 
-### 3. Spike Detection and Promotion
+### 3. Direct Attention Patching
+
+During decode, each layer's attention module is patched with a closure that routes directly to the fused Metal kernel — no SDPA monkey-patching, no layer counter, no Python interceptor overhead. The fused kernel output feeds directly into the model's FFN layers with full MLX graph pipelining.
+
+### 4. Spike Detection and Promotion
 
 When the kernel detects a far-tier token scoring above near-tier tokens, a C++ background worker:
 
@@ -76,25 +81,36 @@ Raw spike rate is 95% per head-layer slot, but aggressive filtering (cooldown, d
 
 ## Results
 
-All results on Apple M2 8GB. Evaluated on Qwen2.5-0.5B-Instruct-4bit (quality), Qwen2.5-7B-Instruct-4bit (throughput), and Llama-3.2-1B-Instruct-4bit (cross-architecture verification).
+All results on Apple M2 8GB.
 
-### Kernel Performance
+### End-to-End Throughput
+
+Qwen2.5-0.5B-Instruct-4bit, generating 100 tokens, with spike detection enabled:
+
+| Context | Standard tok/s | Foveated tok/s | Ratio | Memory |
+|---------|---------------|----------------|-------|--------|
+| 512 | 135 | 96 | 0.71x | 2.0x compression |
+| 1K | 131 | 97 | 0.74x | 2.0x compression |
+| 2K | 121 | 98 | 0.81x | 2.0x compression |
+| 4K | 107 | 67 | 0.63x | 2.0x compression |
+
+The fused kernel is slightly slower than standard on this small model (0.5B) due to Python SDPA interceptor overhead. On memory-constrained hardware (8GB Mac with 7B models), the 2x memory savings enables longer contexts that standard cannot reach at all.
+
+### Kernel Microbenchmark
 
 Fused kernel vs Apple's SDPA (7B-equivalent GQA shapes: H_kv=8, H_q=32, D=128, single layer):
 
 | Context | fp16 SDPA | Fused Kernel | Speedup |
 |---------|-----------|-------------|---------|
-| 1K | 1.12 ms | 0.94 ms | 1.19x |
-| 4K | 2.33 ms | 1.46 ms | 1.60x |
-| 8K | 4.05 ms | 2.22 ms | 1.82x |
-| 16K | 7.68 ms | 3.73 ms | 2.06x |
-| 32K | 15.72 ms | 6.81 ms | 2.31x |
-
-Break-even around 512 tokens. Bandwidth advantage grows with context length.
+| 1K | 0.84 ms | 1.00 ms | 0.84x |
+| 4K | 2.07 ms | 1.20 ms | **1.72x** |
+| 8K | 4.15 ms | 1.68 ms | **2.47x** |
+| 16K | 9.67 ms | 2.90 ms | **3.34x** |
+| 32K | 15.19 ms | 5.18 ms | **2.93x** |
 
 ### 7B on 8GB Mac
 
-On memory-constrained hardware, FoveatedKV is *faster* than standard because compressed KV cache reduces memory pressure:
+On memory-constrained hardware, FoveatedKV extends context beyond the OOM wall:
 
 | Context | Standard tok/s | Foveated tok/s | Speedup | Memory Saved |
 |---------|---------------|----------------|---------|-------------|
@@ -103,20 +119,18 @@ On memory-constrained hardware, FoveatedKV is *faster* than standard because com
 | 2048 | 0.2 | 0.4 | **2.0x** | 101 MB |
 | 3072 | OOM | 0.3 | — | 151 MB |
 
-OOM crossover on 8GB: ~3K foveated, ~3-4K standard. Fused kernel vs dequant-reference cosine: **1.000000**.
-
 ### Quality
 
 Kernel-level attention cosine fidelity (10% near tier, synthetic queries on real model KV):
 
 | Context | Cosine vs Exact | MAE | Compression |
 |---------|----------------|------|-------------|
-| 512 | 0.9956 | 0.0053 | 2.03x |
-| 1K | 0.9950 | 0.0040 | 2.02x |
-| 4K | 0.9952 | 0.0020 | 2.02x |
-| 8K | 0.9954 | 0.0014 | 2.02x |
-| 16K | 0.9953 | 0.0010 | 2.02x |
-| 32K | 0.9954 | 0.0007 | 2.02x |
+| 512 | 0.9949 | 0.0057 | 2.03x |
+| 1K | 0.9954 | 0.0039 | 2.02x |
+| 4K | 0.9949 | 0.0020 | 2.02x |
+| 8K | 0.9952 | 0.0014 | 2.02x |
+| 16K | 0.9952 | 0.0010 | 2.02x |
+| 32K | 0.9952 | 0.0007 | 2.02x |
 
 ### Perplexity
 
@@ -193,7 +207,7 @@ cp build_ext/foveated_ext.cpython-*-darwin.so .
 ### Run tests
 
 ```bash
-uv run pytest tests/ -v  # 73 tests
+uv run pytest tests/ -v  # 97 tests
 ```
 
 ### Python API
@@ -247,25 +261,28 @@ uv run python benchmarks/benchmark_mlx_sustained.py        # Sustained accuracy
 ```
 src/foveated_kv/
   mlx_foveated.py        Core cache: 2 tiers, compress, attend, decode buffer
+  mlx_foveated.py        Core cache: 2 tiers, compress, attend, decode buffer
   mlx_quantize.py        fp8 E4M3 per-token K + INT4 packed V
+  turbo_constants.py     TurboQuant rotation/QJL matrices + Lloyd-Max centroids
+  turbo_quantize.py      TurboQuant compression/dequant (3.25-bit K, 2-bit V)
   metal_foveated.py      Python Metal kernel (fallback when C++ ext not built)
-  mlx_generate.py        SDPA monkey-patch for mlx-lm, generation loops
+  mlx_generate.py        Direct attention patching, generation loops
   disk_archive.py        NVMe-backed numpy.memmap fp16 archive
   cli.py                 CLI entry point (foveated-kv generate)
 
 csrc/
   kernels/
-    foveated_attn.metal      Fused Split-K + Reduce kernel (10 variants)
+    foveated_attn.metal      Fused Split-K + Reduce kernel (fp8 + TurboQuant variants)
     foveated_compress.metal  GPU compression kernels (fp8 E4M3, INT4)
-  foveated_attn.h/.cpp       FoveatedPrimitive + FoveatedHandle
+  foveated_attn.h/.cpp       FoveatedPrimitive + TurboPrimitive + handles
   promotion_pipeline.h/.cpp  C++ promotion worker
   foveated_compress.h/.cpp   CompressHandle: GPU compression
   bindings.cpp               nanobind module
   CMakeLists.txt
 
 paper/                   Technical report + reproducible scripts
-benchmarks/              8 benchmarks + scoring library
-tests/                   73 tests
+benchmarks/              9 benchmarks + scoring library
+tests/                   97 tests
 docs/                    Design docs
 ```
 

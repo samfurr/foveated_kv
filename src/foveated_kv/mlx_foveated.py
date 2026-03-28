@@ -238,6 +238,12 @@ class MLXFoveatedLayer:
         all_k = mx.concatenate([eff_k, far_k_fp], axis=2)
         all_v = mx.concatenate([eff_v, far_v_fp], axis=2)
 
+        # Match query dtype (model may use bf16 while cache stores fp16)
+        q_dtype = query.dtype
+        if all_k.dtype != q_dtype:
+            all_k = all_k.astype(q_dtype)
+            all_v = all_v.astype(q_dtype)
+
         # GQA: expand K,V to match query head count
         n_q_heads = query.shape[1]
         n_kv_heads = all_k.shape[1]
@@ -328,26 +334,24 @@ class MLXFoveatedLayer:
         v16 = new_v.astype(mx.float16)
         self._decode_k_buf.append(k16)
         self._decode_v_buf.append(v16)
-        # Incrementally build cached decode tensors (avoid re-concatenating
-        # the full list on every dispatch — O(1) instead of O(n_tokens))
-        if self._decode_k_cached is None:
-            self._decode_k_cached = k16
-            self._decode_v_cached = v16
-        else:
-            self._decode_k_cached = mx.concatenate(
-                [self._decode_k_cached, k16], axis=2
-            )
-            self._decode_v_cached = mx.concatenate(
-                [self._decode_v_cached, v16], axis=2
-            )
+        self._decode_k_cached = None
+        self._decode_v_cached = None
         self._next_pos += 1
 
     @property
     def decode_k(self) -> Optional[mx.array]:
+        if not self._decode_k_buf:
+            return None
+        if self._decode_k_cached is None:
+            self._decode_k_cached = mx.concatenate(self._decode_k_buf, axis=2)
         return self._decode_k_cached
 
     @property
     def decode_v(self) -> Optional[mx.array]:
+        if not self._decode_v_buf:
+            return None
+        if self._decode_v_cached is None:
+            self._decode_v_cached = mx.concatenate(self._decode_v_buf, axis=2)
         return self._decode_v_cached
 
     @property

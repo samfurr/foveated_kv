@@ -81,64 +81,56 @@ class FusedCacheWrapper:
         return keys, values
 
 
-def _fused_sdpa_interceptor(
-    queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
-    *,
-    scale: float,
-    mask=None,
-    **kwargs,
-) -> mx.array:
-    """Drop-in replacement for mx.fast.scaled_dot_product_attention.
+def _build_fused_interceptor(state: _FusedSDPAState):
+    """Build a closure-based SDPA interceptor for decode-time attention.
 
-    Prefill (seq_len > 1): passes through to the original SDPA.
-    Decode (seq_len == 1): routes through the fused Metal kernel.
+    Captures frequently-accessed state as closure locals (LOAD_FAST)
+    instead of module-global lookups (LOAD_GLOBAL) for lower per-call
+    overhead. Called 24x per decode step.
     """
-    seq_len = queries.shape[2]
+    original = state.original_sdpa
+    layers = state._fov_cache.layers
+    n_layers = state._n_layers
 
-    if seq_len > 1:
-        return _fused_state.original_sdpa(
-            queries, keys, values, scale=scale, mask=mask, **kwargs
-        )
+    def interceptor(
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        *,
+        scale: float,
+        mask=None,
+        **kwargs,
+    ) -> mx.array:
+        if queries.shape[2] > 1:
+            return original(
+                queries, keys, values, scale=scale, mask=mask, **kwargs
+            )
 
-    state = _fused_state
-    layer_idx = state._layer_counter
-    state._layer_counter += 1
+        idx = state._layer_counter
+        state._layer_counter = idx + 1
+        if idx >= n_layers:
+            idx = idx % n_layers
 
-    if layer_idx >= state._n_layers:
-        layer_idx = layer_idx % state._n_layers
+        layer = layers[idx]
+        if layer is None or state._fused_disabled:
+            return original(
+                queries, keys, values, scale=scale, mask=mask, **kwargs
+            )
 
-    fov_layer = state._fov_cache.layers[layer_idx]
-    if fov_layer is None or state._fused_disabled:
-        return state.original_sdpa(
-            queries, keys, values, scale=scale, mask=mask, **kwargs
-        )
+        out, flags, tokens = layer.attend_fused_with_spikes(queries)
 
-    try:
-        out, flags, tokens = fov_layer.attend_fused_with_spikes(queries)
-    except Exception:
-        import logging
-        logging.getLogger("foveated_kv").warning(
-            "Fused Metal kernel failed — falling back to standard SDPA "
-            "for the rest of this session"
-        )
-        state._fused_disabled = True
-        return state.original_sdpa(
-            queries, keys, values, scale=scale, mask=mask, **kwargs
-        )
+        wrappers = state._fused_wrappers
+        if wrappers is not None and idx < len(wrappers):
+            w = wrappers[idx]
+            if w is not None:
+                w._spike_flags = flags
+                w._spike_tokens = tokens
 
-    # Stash spike arrays on the wrapper for drain at end of step.
-    # They're part of the same computation graph as `out`, so
-    # mx.eval(logits) materializes them for free.
-    wrappers = state._fused_wrappers
-    if wrappers is not None and layer_idx < len(wrappers):
-        w = wrappers[layer_idx]
-        if w is not None:
-            w._spike_flags = flags
-            w._spike_tokens = tokens
+        if out.dtype != queries.dtype:
+            out = out.astype(queries.dtype)
+        return out
 
-    return out
+    return interceptor
 
 
 def install_fused_sdpa(fov_cache: MLXFoveatedKVCache) -> None:
@@ -146,6 +138,10 @@ def install_fused_sdpa(fov_cache: MLXFoveatedKVCache) -> None:
 
     Monkey-patches mx.fast.scaled_dot_product_attention so decode-time
     attention (seq_len=1) routes through the fused Metal kernel.
+
+    Validates the kernel once at install time. If validation fails,
+    sets _fused_disabled so the interceptor always falls back to
+    standard SDPA without per-dispatch try/except overhead.
     """
     if _fused_state._installed:
         raise RuntimeError("Fused SDPA already installed — call uninstall_fused_sdpa() first")
@@ -160,7 +156,26 @@ def install_fused_sdpa(fov_cache: MLXFoveatedKVCache) -> None:
     _fused_state._fused_disabled = False
     _fused_state._installed = True
 
-    mx.fast.scaled_dot_product_attention = _fused_sdpa_interceptor
+    # Validate kernel once — catch failures here instead of per-dispatch.
+    try:
+        test_layer = next(
+            (l for l in fov_cache.layers if l is not None), None
+        )
+        if test_layer is not None:
+            B = test_layer.near_k.shape[0]
+            H_q = test_layer.near_k.shape[1]
+            D = test_layer.near_k.shape[-1]
+            dummy_q = mx.zeros((B, H_q, 1, D), dtype=mx.float16)
+            test_layer.attend_fused_with_spikes(dummy_q)
+            mx.eval(dummy_q)
+    except Exception:
+        import logging
+        logging.getLogger("foveated_kv").warning(
+            "Fused Metal kernel validation failed — using standard SDPA fallback"
+        )
+        _fused_state._fused_disabled = True
+
+    mx.fast.scaled_dot_product_attention = _build_fused_interceptor(_fused_state)
 
 
 def uninstall_fused_sdpa() -> None:

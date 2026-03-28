@@ -510,7 +510,6 @@ class TestSDPAFallback:
     def _make_fused_setup(self, S=256, H_kv=2, D=64, H_q=8):
         from foveated_kv.mlx_generate import (
             _fused_state,
-            _fused_sdpa_interceptor,
             install_fused_sdpa,
             uninstall_fused_sdpa,
             FusedCacheWrapper,
@@ -525,51 +524,53 @@ class TestSDPAFallback:
         return cache, _fused_state, install_fused_sdpa, uninstall_fused_sdpa, FusedCacheWrapper
 
     def test_fallback_on_kernel_failure(self):
-        """Metal kernel exception → falls back to standard SDPA."""
+        """Metal kernel exception at install → fused_disabled, interceptor uses SDPA."""
         cache, state, install, uninstall, Wrapper = self._make_fused_setup()
+
+        # Break the kernel before install — install-time validation catches it
+        original_method = cache.layers[0].attend_fused_with_spikes
+        cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
+            RuntimeError("Metal kernel failed")
+        )
+
         install(cache)
         try:
-            # Force attend_fused_with_spikes to throw
-            original_method = cache.layers[0].attend_fused_with_spikes
-            cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
-                RuntimeError("Metal kernel failed")
-            )
+            assert state._fused_disabled is True
 
             query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
             mx.eval(query)
 
-            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
-            out = _fused_sdpa_interceptor(
-                query, query, query, scale=1.0 / (64 ** 0.5), mask=None
-            )
+            # Interceptor should fall back to standard SDPA
+            interceptor = mx.fast.scaled_dot_product_attention
+            out = interceptor(query, query, query, scale=1.0 / (64 ** 0.5), mask=None)
             mx.eval(out)
-            # Should produce valid output via fallback
             assert out.shape == (1, 8, 1, 64)
             cache.layers[0].attend_fused_with_spikes = original_method
         finally:
             uninstall()
 
     def test_permanent_disable_after_failure(self):
-        """After first failure, fused is permanently disabled."""
+        """After install-time failure, fused stays permanently disabled."""
         cache, state, install, uninstall, Wrapper = self._make_fused_setup()
+
+        original_method = cache.layers[0].attend_fused_with_spikes
+        cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
+            RuntimeError("Metal kernel failed")
+        )
+
         install(cache)
         try:
-            original_method = cache.layers[0].attend_fused_with_spikes
-            cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
-                RuntimeError("Metal kernel failed")
-            )
-
-            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
-            mx.eval(query)
-
-            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
-            _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
             assert state._fused_disabled is True
 
             # Restore method — should still be disabled
             cache.layers[0].attend_fused_with_spikes = original_method
+
+            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
+            mx.eval(query)
+
+            interceptor = mx.fast.scaled_dot_product_attention
             state._layer_counter = 0
-            out = _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
+            out = interceptor(query, query, query, scale=0.125, mask=None)
             mx.eval(out)
             assert state._fused_disabled is True
             assert out.shape == (1, 8, 1, 64)
@@ -577,33 +578,33 @@ class TestSDPAFallback:
             uninstall()
 
     def test_warning_logged_once(self, caplog):
-        """Warning is logged exactly once on first failure."""
+        """Warning is logged exactly once at install time on failure."""
         import logging
         cache, state, install, uninstall, Wrapper = self._make_fused_setup()
-        install(cache)
-        try:
-            cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
-                RuntimeError("Metal kernel failed")
-            )
 
-            query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
-            mx.eval(query)
+        cache.layers[0].attend_fused_with_spikes = lambda q: (_ for _ in ()).throw(
+            RuntimeError("Metal kernel failed")
+        )
 
-            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
-            with caplog.at_level(logging.WARNING, logger="foveated_kv"):
-                # First call — triggers warning
-                _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
-                # Second call — fused already disabled, no new warning
+        with caplog.at_level(logging.WARNING, logger="foveated_kv"):
+            install(cache)
+            try:
+                query = mx.random.normal((1, 8, 1, 64)).astype(mx.float16)
+                mx.eval(query)
+
+                interceptor = mx.fast.scaled_dot_product_attention
+                # These calls should NOT log additional warnings
+                interceptor(query, query, query, scale=0.125, mask=None)
                 state._layer_counter = 0
-                _fused_sdpa_interceptor(query, query, query, scale=0.125, mask=None)
+                interceptor(query, query, query, scale=0.125, mask=None)
+            finally:
+                uninstall()
 
-            warning_count = sum(
-                1 for r in caplog.records
-                if "falling back to standard SDPA" in r.message
-            )
-            assert warning_count == 1, f"Expected 1 warning, got {warning_count}"
-        finally:
-            uninstall()
+        warning_count = sum(
+            1 for r in caplog.records
+            if "fallback" in r.message.lower() or "falling back" in r.message.lower()
+        )
+        assert warning_count == 1, f"Expected 1 warning, got {warning_count}"
 
     def test_fallback_produces_correct_output(self):
         """Fallback output matches standard SDPA exactly."""
@@ -618,7 +619,7 @@ class TestSDPAFallback:
         mx.eval(keys, values, query)
 
         # Standard SDPA reference
-        ref = state.original_sdpa or mx.fast.scaled_dot_product_attention
+        ref = mx.fast.scaled_dot_product_attention
         ref_out = ref(query, keys, values, scale=1.0 / (D ** 0.5))
         mx.eval(ref_out)
 
@@ -626,8 +627,8 @@ class TestSDPAFallback:
         install(cache)
         try:
             state._fused_disabled = True
-            from foveated_kv.mlx_generate import _fused_sdpa_interceptor
-            fb_out = _fused_sdpa_interceptor(
+            interceptor = mx.fast.scaled_dot_product_attention
+            fb_out = interceptor(
                 query, keys, values, scale=1.0 / (D ** 0.5), mask=None
             )
             mx.eval(fb_out)

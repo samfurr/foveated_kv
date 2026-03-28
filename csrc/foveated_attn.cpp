@@ -166,9 +166,9 @@ std::vector<array> FoveatedHandle::operator()(
     const array& query,
     const array& decode_k, const array& decode_v)
 {
-    auto q = astype(query, float16);
-    auto dk = astype(decode_k, float16);
-    auto dv = astype(decode_v, float16);
+    auto q = (query.dtype() == float16) ? query : astype(query, float16);
+    auto dk = (decode_k.dtype() == float16) ? decode_k : astype(decode_k, float16);
+    auto dv = (decode_v.dtype() == float16) ? decode_v : astype(decode_v, float16);
 
     int H_q = q.shape(1);
     int n_decode = dk.shape(2);

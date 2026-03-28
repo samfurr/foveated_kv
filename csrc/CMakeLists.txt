@@ -4,11 +4,11 @@ project(foveated_ext LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find MLX (installed via pip, MLX_DIR set by mlx.extension.CMakeBuild)
+# Find MLX (installed via pip)
 find_package(MLX CONFIG REQUIRED)
 
-# Include MLX's extension.cmake for mlx_build_metallib macro
-include(${MLX_CMAKE_DIR}/extension.cmake)
+# extension.cmake is included by MLXConfig.cmake automatically.
+# No separate include needed — mlx_build_metallib is already available.
 
 # Compile Metal kernel to precompiled metallib
 mlx_build_metallib(

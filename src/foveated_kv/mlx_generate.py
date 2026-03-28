@@ -195,6 +195,76 @@ def uninstall_fused_sdpa() -> None:
     _fused_state._installed = False
 
 
+# ---------------------------------------------------------------------------
+# Direct attention module patching (zero-overhead decode path)
+# ---------------------------------------------------------------------------
+
+
+def install_fused_attention(model, fov_cache: MLXFoveatedKVCache) -> list:
+    """Patch each attention module to call the fused kernel directly.
+
+    Instead of intercepting mx.fast.scaled_dot_product_attention globally,
+    this replaces each layer's attention __call__ with a version that routes
+    decode (seq_len=1) through the fused Metal kernel. No layer counter,
+    no state management, no SDPA monkey-patch.
+
+    Returns a list of FusedCacheWrapper objects for use as the cache arg.
+    """
+    import types
+
+    original_sdpa = mx.fast.scaled_dot_product_attention
+    layers = fov_cache.layers
+    wrappers = []
+
+    for layer_idx, mlx_layer in enumerate(model.model.layers):
+        fov_layer = layers[layer_idx]
+        wrapper = FusedCacheWrapper(fov_layer, layer_idx) if fov_layer else None
+        wrappers.append(wrapper)
+
+        if fov_layer is None:
+            continue
+
+        attn = mlx_layer.self_attn
+        scale = attn.scale
+
+        def _make_fused_call(fov_l, sc):
+            def _fused_call(self, x, mask=None, cache=None):
+                B, L, D = x.shape
+                queries = self.q_proj(x)
+                keys = self.k_proj(x)
+                values = self.v_proj(x)
+                queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+                keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                if cache is not None:
+                    queries = self.rope(queries, offset=cache.offset)
+                    keys = self.rope(keys, offset=cache.offset)
+                    keys, values = cache.update_and_fetch(keys, values)
+                if L == 1 and cache is not None:
+                    output, _, _ = fov_l.attend_fused_with_spikes(queries)
+                    if output.dtype != queries.dtype:
+                        output = output.astype(queries.dtype)
+                else:
+                    output = original_sdpa(
+                        queries, keys, values, scale=sc, mask=mask
+                    )
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(output)
+            return _fused_call
+
+        attn.__call__ = types.MethodType(_make_fused_call(fov_layer, scale), attn)
+
+    return wrappers
+
+
+def uninstall_fused_attention(model) -> None:
+    """Remove per-instance attention patches, restoring original __call__."""
+    for mlx_layer in model.model.layers:
+        attn = mlx_layer.self_attn
+        if "__call__" in attn.__dict__:
+            del attn.__call__
+
+
 def reset_fused_layer_counter() -> None:
     """Reset layer counter and drain spikes into the C++ pipeline.
 

@@ -448,3 +448,352 @@ INST(half, f16, 128, 1) INST(half, f16, 128, 2) INST(half, f16, 128, 4) INST(hal
 INST(bfloat, bf16, 64, 1) INST(bfloat, bf16, 64, 2) INST(bfloat, bf16, 64, 4) INST(bfloat, bf16, 64, 8) INST(bfloat, bf16, 64, 16)
 INST(bfloat, bf16, 128, 1) INST(bfloat, bf16, 128, 2) INST(bfloat, bf16, 128, 4) INST(bfloat, bf16, 128, 8) INST(bfloat, bf16, 128, 16)
 #undef INST
+
+
+// ============================================================================
+// TurboQuant 2-tier attention kernel
+//
+// Far tier uses TurboQuant: 2-bit Lloyd-Max key indices + 1-bit QJL signs
+// + 2-bit symmetric group-quantized values.
+//
+// Score computation avoids full dequantization:
+//   score = norm_k * dot(q_rot, centroids[indices])
+//         + sqrt(pi/2)/D * gamma * dot(signs, q_sketch)
+//
+// where q_rot = q @ Pi^T and q_sketch = S @ q are precomputed once per query.
+//
+// 4-entry codebook fits in registers (no threadgroup LUT needed).
+// Sign dot is conditional negate + accumulate.
+// ============================================================================
+
+struct TurboBlobOffsets {
+    uint near_k;
+    uint near_v;
+    uint far_k_indices;   // packed 2-bit Lloyd-Max (D/4 bytes per token)
+    uint far_k_signs;     // packed 1-bit QJL signs (D/8 bytes per token)
+    uint far_k_norm;      // fp16 key norms
+    uint far_k_gamma;     // fp16 residual norms
+    uint far_v_packed;    // packed 2-bit values (D/4 bytes per token)
+    uint far_v_scale;     // fp16 per-group scales (D/32 per token)
+    uint near_valid;
+};
+
+
+// ============================================================================
+// TurboQuant far K score — codebook dot + QJL sign dot
+// ============================================================================
+
+template <int CPT>
+inline float dot_turbo_k(
+    const thread float* q_rot,       // pre-rotated query fragment
+    const thread float* q_sketch,    // pre-sketched query fragment
+    const device uint8_t* indices,   // packed 2-bit, D/4 bytes per token
+    uint idx_off,
+    const device uint8_t* signs,     // packed 1-bit, D/8 bytes per token
+    uint sign_off,
+    float norm_k,
+    float gamma,
+    const thread float* cb,          // 4 centroids in registers
+    uint D,
+    uint lid)                        // lane_id
+{
+    // MSE score: norm_k * sum_j(q_rot[j] * centroids[indices[j]])
+    float dot_mse = 0.0f;
+    for (uint c = 0; c < CPT; c++) {
+        uint byte_idx = (lid * CPT + c) / 4;
+        uint bit_shift = ((lid * CPT + c) % 4) * 2;
+        uint idx = (indices[idx_off + byte_idx] >> bit_shift) & 0x3;
+        dot_mse += q_rot[c] * cb[idx];
+    }
+    float score_mse = norm_k * simd_sum(dot_mse);
+
+    // QJL score: sqrt(pi/2)/D * gamma * sum_j(sign[j] * q_sketch[j])
+    float dot_sign = 0.0f;
+    for (uint c = 0; c < CPT; c++) {
+        uint byte_idx = (lid * CPT + c) / 8;
+        uint bit_idx = (lid * CPT + c) % 8;
+        float s = ((signs[sign_off + byte_idx] >> bit_idx) & 1) ? 1.0f : -1.0f;
+        dot_sign += s * q_sketch[c];
+    }
+    float score_qjl = (1.2533141f / (float)D) * gamma * simd_sum(dot_sign);
+
+    return score_mse + score_qjl;
+}
+
+
+// ============================================================================
+// TurboQuant 2-bit V dequantization — symmetric group quantization
+//
+// 4 levels: {0,1,2,3} → {-1, -1/3, 1/3, 1} * group_scale
+// Group size 32, so D/32 scales per token.
+// ============================================================================
+
+constant float TURBO_V_LEVELS[4] = {-1.0f, -0.333333f, 0.333333f, 1.0f};
+
+template <int CPT>
+inline void load_turbo_v(
+    thread float* v_vals,
+    const device uint8_t* packed,
+    uint v_off,
+    const device half* scales,
+    uint scale_off,
+    uint group_size,
+    uint lid)                       // lane_id
+{
+    for (uint c = 0; c < CPT; c++) {
+        uint global_dim = lid * CPT + c;
+        uint byte_idx = global_dim / 4;
+        uint bit_shift = (global_dim % 4) * 2;
+        uint idx = (packed[v_off + byte_idx] >> bit_shift) & 0x3;
+        uint group_idx = global_dim / group_size;
+        float scale = (float)scales[scale_off + group_idx];
+        v_vals[c] = TURBO_V_LEVELS[idx] * scale;
+    }
+}
+
+
+// ============================================================================
+// TurboQuant main kernel
+// ============================================================================
+
+template <typename QT, int HEAD_DIM, int MAX_SPLITS>
+[[kernel, max_total_threads_per_threadgroup(MAX_SPLITS * 32)]]
+void foveated_2tier_turbo(
+    const device uint8_t* blob              [[buffer(0)]],
+    const device QT* query                  [[buffer(1)]],
+    const device half* decode_k             [[buffer(2)]],
+    const device half* decode_v             [[buffer(3)]],
+    device QT* out                          [[buffer(4)]],
+    device int32_t* spike_flags             [[buffer(5)]],
+    device int32_t* spike_tokens            [[buffer(6)]],
+    const constant FoveatedParams& params   [[buffer(7)]],
+    const constant TurboBlobOffsets& offsets [[buffer(8)]],
+    const device float* Pi                  [[buffer(9)]],
+    const device float* S_mat               [[buffer(10)]],
+    const constant float* centroids         [[buffer(11)]],
+    uint tg_pos [[threadgroup_position_in_grid]],
+    uint thread_pos [[thread_position_in_threadgroup]])
+{
+    constexpr int CPT = HEAD_DIM / 32;
+    constexpr int HEAD_DIM_QUARTER = HEAD_DIM / 4;
+    constexpr int HEAD_DIM_EIGHTH = HEAD_DIM / 8;
+    constexpr int V_GROUP_SIZE = 32;
+    constexpr int V_GROUPS_PER_TOKEN = HEAD_DIM / V_GROUP_SIZE;
+
+    const float SCORE_SKIP = 16.0f;
+
+    const uint N_NEAR = FC_N_NEAR;
+    const uint N_FAR  = FC_N_FAR;
+    const uint H_Q = FC_H_Q;
+    const uint H_KV = FC_H_KV;
+    const uint GQA_RATIO = FC_GQA_RATIO;
+    const uint SPLIT_SIZE = FC_SPLIT_SIZE;
+
+    const uint N_DECODE = params.n_decode;
+    const float SPIKE_MARGIN = params.spike_margin;
+
+    // Unpack blob pointers
+    auto near_k      = (const device half*)     (blob + offsets.near_k);
+    auto near_v      = (const device half*)     (blob + offsets.near_v);
+    auto far_idx     = (const device uint8_t*)  (blob + offsets.far_k_indices);
+    auto far_signs   = (const device uint8_t*)  (blob + offsets.far_k_signs);
+    auto far_k_norm  = (const device half*)     (blob + offsets.far_k_norm);
+    auto far_k_gamma = (const device half*)     (blob + offsets.far_k_gamma);
+    auto far_v_pack  = (const device uint8_t*)  (blob + offsets.far_v_packed);
+    auto far_v_scale = (const device half*)     (blob + offsets.far_v_scale);
+    auto near_valid  = (const device uint32_t*) (blob + offsets.near_valid);
+
+    const uint bh_q     = tg_pos;
+    const uint simd_id  = thread_pos / 32;
+    const uint lane_id  = thread_pos % 32;
+    const uint split_id = simd_id;
+
+    const uint batch_idx = bh_q / H_Q;
+    const uint q_head    = bh_q % H_Q;
+    const uint kv_head   = q_head / GQA_RATIO;
+    const uint bh_kv     = batch_idx * H_KV + kv_head;
+
+    // ================================================================
+    // Load query and pre-compute q_rot = q @ Pi^T and q_sketch = S @ q
+    // These are amortized across the entire far sequence.
+    // ================================================================
+    const float INV_SQRT_D = rsqrt((float)HEAD_DIM);
+    float q_raw[CPT];
+    for (uint c = 0; c < CPT; c++)
+        q_raw[c] = (float)query[bh_q * HEAD_DIM + lane_id * CPT + c];
+
+    // q_reg = q * 1/sqrt(D) for near/decode attention
+    float q_reg[CPT];
+    for (uint c = 0; c < CPT; c++)
+        q_reg[c] = q_raw[c] * INV_SQRT_D;
+
+    // q_rot[c] = sum_j(q[j] * Pi[j, lane_id*CPT+c]) — unscaled
+    // The full turbo score is multiplied by INV_SQRT_D after dot_turbo_k
+    // to match near/decode tier score scale.
+    float q_rot[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        float dot = 0.0f;
+        uint col = lane_id * CPT + c;
+        for (uint qc = 0; qc < CPT; qc++)
+            dot += q_raw[qc] * Pi[(lane_id * CPT + qc) * HEAD_DIM + col];
+        q_rot[c] = simd_sum(dot);
+    }
+
+    // q_sketch[c] = sum_j(S[lane_id*CPT+c, j] * q[j])
+    // NOT scaled by 1/sqrt(D) — the QJL coefficient already accounts for it.
+    float q_sketch[CPT];
+    for (uint c = 0; c < CPT; c++) {
+        float dot = 0.0f;
+        uint row = lane_id * CPT + c;
+        for (uint qc = 0; qc < CPT; qc++)
+            dot += S_mat[row * HEAD_DIM + lane_id * CPT + qc] * q_raw[qc];
+        q_sketch[c] = simd_sum(dot);
+    }
+
+    // Load centroids into registers (only 4 values)
+    float cb[4];
+    cb[0] = centroids[0]; cb[1] = centroids[1];
+    cb[2] = centroids[2]; cb[3] = centroids[3];
+
+    // Online softmax state
+    float m_val = -INFINITY, l_val = 0.0f;
+    float acc[CPT];
+    for (uint c = 0; c < CPT; c++) acc[c] = 0.0f;
+
+    float min_near_score = INFINITY, max_far_score = -INFINITY;
+    int max_far_token = -1;
+
+    // Split range computation (identical to fp8 kernel)
+    const uint S_total = N_NEAR + N_FAR + N_DECODE;
+    const uint gstart  = split_id * SPLIT_SIZE;
+    const uint gend    = min(gstart + SPLIT_SIZE, S_total);
+
+    const uint near_start = min(gstart, N_NEAR);
+    const uint near_end   = min(gend,   N_NEAR);
+    const uint far_start  = (gstart > N_NEAR) ? min(gstart - N_NEAR, N_FAR) : 0u;
+    const uint far_end    = (gend   > N_NEAR) ? min(gend   - N_NEAR, N_FAR) : 0u;
+    const uint nf = N_NEAR + N_FAR;
+    const uint dec_start  = (gstart > nf) ? min(gstart - nf, N_DECODE) : 0u;
+    const uint dec_end    = (gend   > nf) ? min(gend   - nf, N_DECODE) : 0u;
+
+    // ==== NEAR (fp16 K+V — identical to fp8 kernel) ====
+    const uint near_valid_count = near_valid[kv_head];
+    const uint near_loop_end = min(near_end, near_valid_count);
+    const uint near_kv_base = bh_kv * N_NEAR * HEAD_DIM;
+    for (uint t = near_start; t < near_loop_end; t++) {
+        attend_fp16<CPT>(q_reg, near_k, near_v,
+                         near_kv_base + t * HEAD_DIM + lane_id * CPT,
+                         m_val, l_val, acc, min_near_score);
+    }
+
+    // ==== FAR (TurboQuant K + 2-bit V) ====
+    const uint far_idx_base   = bh_kv * N_FAR * HEAD_DIM_QUARTER;
+    const uint far_sign_base  = bh_kv * N_FAR * HEAD_DIM_EIGHTH;
+    const uint far_norm_base  = bh_kv * N_FAR;
+    const uint far_vp_base    = bh_kv * N_FAR * HEAD_DIM_QUARTER;
+    const uint far_vs_base    = bh_kv * N_FAR * V_GROUPS_PER_TOKEN;
+
+    for (uint t = far_start; t < far_end; t++) {
+        float nk = (float)far_k_norm[far_norm_base + t];
+        float gm = (float)far_k_gamma[far_norm_base + t];
+
+        float score = dot_turbo_k<CPT>(
+            q_rot, q_sketch,
+            far_idx, far_idx_base + t * HEAD_DIM_QUARTER,
+            far_signs, far_sign_base + t * HEAD_DIM_EIGHTH,
+            nk, gm, cb, HEAD_DIM, lane_id) * INV_SQRT_D;
+
+        if (score > max_far_score) {
+            max_far_score = score;
+            max_far_token = (int)t;
+        }
+
+        if (score >= m_val - SCORE_SKIP) {
+            float v_vals[CPT];
+            load_turbo_v<CPT>(v_vals, far_v_pack,
+                              far_vp_base + t * HEAD_DIM_QUARTER,
+                              far_v_scale,
+                              far_vs_base + t * V_GROUPS_PER_TOKEN,
+                              V_GROUP_SIZE, lane_id);
+            softmax_accum<CPT>(score, m_val, l_val, acc, v_vals);
+        }
+    }
+
+    // ==== DECODE (fp16 K+V — identical to fp8 kernel) ====
+    const uint dec_kv_base = bh_kv * N_DECODE * HEAD_DIM;
+    for (uint t = dec_start; t < dec_end; t++) {
+        attend_fp16<CPT>(q_reg, decode_k, decode_v,
+                         dec_kv_base + t * HEAD_DIM + lane_id * CPT,
+                         m_val, l_val, acc, min_near_score);
+    }
+
+    // ==== SPLIT REDUCE (identical to fp8 kernel) ====
+    threadgroup float shared_acc[MAX_SPLITS * HEAD_DIM];
+    threadgroup float shared_l[MAX_SPLITS];
+    threadgroup float shared_m[MAX_SPLITS];
+    threadgroup float shared_min_near[MAX_SPLITS];
+    threadgroup float shared_max_far[MAX_SPLITS];
+    threadgroup int   shared_far_tok[MAX_SPLITS];
+
+    for (uint c = 0; c < CPT; c++)
+        shared_acc[split_id * HEAD_DIM + lane_id * CPT + c] = acc[c];
+    if (lane_id == 0) {
+        shared_l[split_id]         = l_val;
+        shared_m[split_id]         = m_val;
+        shared_min_near[split_id]  = min_near_score;
+        shared_max_far[split_id]   = max_far_score;
+        shared_far_tok[split_id]   = max_far_token;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0) {
+        float m_global = -INFINITY, l_global = 0.0f;
+        float racc[CPT];
+        for (uint c = 0; c < CPT; c++) racc[c] = 0.0f;
+        float min_near = INFINITY, max_far = -INFINITY;
+        int far_token = -1;
+
+        for (uint s = 0; s < FC_NUM_SPLITS; s++) {
+            float m_s = shared_m[s];
+            if (m_s == -INFINITY) continue;
+            float l_s = shared_l[s];
+            float m_new = max(m_global, m_s);
+            float ag = (m_global > -INFINITY) ? exp(m_global - m_new) : 0.0f;
+            float as_val = exp(m_s - m_new);
+            l_global = fma(ag, l_global, as_val * l_s);
+            for (uint c = 0; c < CPT; c++) {
+                float pv = shared_acc[s * HEAD_DIM + lane_id * CPT + c];
+                racc[c] = fma(ag, racc[c], as_val * pv);
+            }
+            m_global = m_new;
+            min_near = min(min_near, shared_min_near[s]);
+            float fs = shared_max_far[s];
+            if (fs > max_far) { max_far = fs; far_token = shared_far_tok[s]; }
+        }
+
+        float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
+        for (uint c = 0; c < CPT; c++)
+            out[bh_q * HEAD_DIM + lane_id * CPT + c] = (QT)(racc[c] * inv_l);
+
+        if (lane_id == 0) {
+            spike_flags[bh_q]  = (max_far > min_near + SPIKE_MARGIN) ? 1 : 0;
+            spike_tokens[bh_q] = far_token;
+        }
+    }
+}
+
+
+// TurboQuant kernel instantiations
+#define INST_TURBO(QT, QN, D, S) \
+template [[host_name("foveated_2tier_turbo_" #QN "_d" #D "_s" #S)]] \
+kernel void foveated_2tier_turbo<QT, D, S>( \
+    const device uint8_t*, const device QT*, const device half*, const device half*, \
+    device QT*, device int32_t*, device int32_t*, \
+    const constant FoveatedParams&, const constant TurboBlobOffsets&, \
+    const device float*, const device float*, const constant float*, uint, uint);
+
+INST_TURBO(half, f16, 64, 1) INST_TURBO(half, f16, 64, 2) INST_TURBO(half, f16, 64, 4) INST_TURBO(half, f16, 64, 8) INST_TURBO(half, f16, 64, 16)
+INST_TURBO(half, f16, 128, 1) INST_TURBO(half, f16, 128, 2) INST_TURBO(half, f16, 128, 4) INST_TURBO(half, f16, 128, 8) INST_TURBO(half, f16, 128, 16)
+INST_TURBO(bfloat, bf16, 64, 1) INST_TURBO(bfloat, bf16, 64, 2) INST_TURBO(bfloat, bf16, 64, 4) INST_TURBO(bfloat, bf16, 64, 8) INST_TURBO(bfloat, bf16, 64, 16)
+INST_TURBO(bfloat, bf16, 128, 1) INST_TURBO(bfloat, bf16, 128, 2) INST_TURBO(bfloat, bf16, 128, 4) INST_TURBO(bfloat, bf16, 128, 8) INST_TURBO(bfloat, bf16, 128, 16)
+#undef INST_TURBO

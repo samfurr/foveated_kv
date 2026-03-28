@@ -99,6 +99,32 @@ NB_MODULE(foveated_ext, m) {
             &foveated::PromotionPipeline::stop,
             "Stop the worker thread.");
 
+    // ---- TurboFoveatedHandle: TurboQuant attention dispatch ----
+    nb::class_<foveated::TurboFoveatedHandle>(m, "TurboFoveatedHandle")
+        .def(nb::init<
+            const array&, const array&,
+            const array&, const array&, const array&, const array&,
+            const array&, const array&, const array&,
+            const array&, const array&, const array&,
+            float, const std::string&>(),
+            nb::arg("near_k"), nb::arg("near_v"),
+            nb::arg("far_k_indices"), nb::arg("far_k_signs"),
+            nb::arg("far_k_norm"), nb::arg("far_k_gamma"),
+            nb::arg("far_v_packed"), nb::arg("far_v_scale"),
+            nb::arg("near_valid"),
+            nb::arg("Pi"), nb::arg("S_mat"), nb::arg("centroids"),
+            nb::arg("spike_margin") = 0.5f,
+            nb::arg("metallib_path") = "",
+            "Build TurboQuant handle with compressed tier arrays and constant matrices.")
+        .def("__call__",
+            &foveated::TurboFoveatedHandle::operator(),
+            nb::arg("query"),
+            nb::arg("decode_k"), nb::arg("decode_v"),
+            "Dispatch TurboQuant kernel. Returns (out, spike_flags, spike_tokens).")
+        .def("get_blob_info",
+            &foveated::TurboFoveatedHandle::get_blob_info,
+            "Get blob write info for promotion pipeline registration.");
+
     // ---- Compression ----
     nb::class_<foveated::TierConfig>(m, "TierConfig")
         .def(nb::init<>())

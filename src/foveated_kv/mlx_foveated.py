@@ -22,6 +22,7 @@ _original_sdpa = mx.fast.scaled_dot_product_attention
 # Optional C++ extension (precompiled metallib + FoveatedPrimitive + CompressHandle)
 _cpp_available = False
 _FoveatedHandle = None
+_TurboFoveatedHandle = None
 _CompressHandle = None
 _CppTierConfig = None
 _PromotionPipeline = None
@@ -33,6 +34,7 @@ try:
     if "src" not in _sys.path:
         _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", ".."))
     from foveated_ext import FoveatedHandle as _FoveatedHandle
+    from foveated_ext import TurboFoveatedHandle as _TurboFoveatedHandle
     from foveated_ext import CompressHandle as _CompressHandle
     from foveated_ext import TierConfig as _CppTierConfig
     from foveated_ext import PromotionPipeline as _PromotionPipeline
@@ -110,11 +112,18 @@ def _dequant_int4_per_token(packed: mx.array, scale: mx.array, zero: mx.array) -
 class MLXTierConfig:
     """Configuration for 2-tier foveated cache."""
 
-    near_pct: float = 0.10  # 10% near (fp16), 90% far (fp8 K + int4 V)
+    near_pct: float = 0.10  # 10% near (fp16), 90% far (compressed)
     n_sinks: int = 4
     window_size: int = 32
     promo_headroom_pct: float = 0.5
     promo_headroom_min: int = 8
+    compress_method: str = "fp8"  # "fp8" (fp8 K + int4 V) or "turbo" (TurboQuant)
+
+    def __post_init__(self):
+        if self.compress_method not in ("fp8", "turbo"):
+            raise ValueError(
+                f"compress_method must be 'fp8' or 'turbo', got '{self.compress_method}'"
+            )
 
     def tier_boundaries(self, S: int) -> dict:
         """Compute tier boundaries for sequence length S.
@@ -165,8 +174,7 @@ class MLXFoveatedLayer:
     """Single-layer 2-tier foveated KV store.
 
     Near: fp16 K + V (sinks, window, high-importance middle)
-    Far K: fp8 E4M3 (register-level dequant in Metal kernel)
-    Far V: int4 per-token (nibble-packed, per-token scale+zero)
+    Far: fp8 K + int4 V (default) or TurboQuant K + 2-bit V (opt-in)
     """
 
     # Near: fp16
@@ -174,9 +182,9 @@ class MLXFoveatedLayer:
     near_v: mx.array   # (B, H, N_near, D) float16
     near_idx: mx.array  # (B, H, N_near) int32
 
-    # Far K: fp8 E4M3
+    # Far K: fp8 E4M3 (compress_method="fp8")
     far_k: mx.array    # (B, H, F, D) uint8
-    # Far V: int4 per-token packed
+    # Far V: int4 per-token packed (compress_method="fp8")
     far_v: mx.array    # (B, H, F, D//2) uint8
     far_v_scale: mx.array  # (B, H, F) float16
     far_v_zero: mx.array   # (B, H, F) float16
@@ -189,6 +197,16 @@ class MLXFoveatedLayer:
 
     # Per-head valid count for near tier (includes padding headroom)
     near_valid: Optional[mx.array] = None  # (H_kv,) int32
+
+    # TurboQuant far tier (populated when compress_method="turbo")
+    compress_method: str = "fp8"
+    turbo_far_k_indices: Optional[mx.array] = None  # (B,H,F,D//4) uint8
+    turbo_far_k_signs: Optional[mx.array] = None    # (B,H,F,D//8) uint8
+    turbo_far_k_norm: Optional[mx.array] = None     # (B,H,F) float16
+    turbo_far_k_gamma: Optional[mx.array] = None    # (B,H,F) float16
+    turbo_far_v_packed: Optional[mx.array] = None   # (B,H,F,D//4) uint8
+    turbo_far_v_scale: Optional[mx.array] = None    # (B,H,F,D//32) float16
+    _turbo_constants: Optional[object] = None
 
     def __post_init__(self):
         max_pos = -1
@@ -222,11 +240,14 @@ class MLXFoveatedLayer:
         """Mixed-precision attention: near (fp16) + far (reconstructed fp16).
 
         Args:
-            query: (B, H_q, 1, D) float16
+            query: (B, H_q, 1, D) float16/bf16
 
         Returns:
-            (B, H_q, 1, D) float16
+            (B, H_q, 1, D) matching query dtype
         """
+        if self.compress_method == "turbo":
+            return self._attend_turbo(query)
+
         # Reconstruct far K: fp8 E4M3 → fp16
         far_k_fp = _e4m3_to_fp16(self.far_k)
         # Reconstruct far V: int4 per-token → fp16
@@ -256,6 +277,40 @@ class MLXFoveatedLayer:
         scale = 1.0 / math.sqrt(query.shape[-1])
         return _original_sdpa(query, all_k, all_v, scale=scale)
 
+    def _attend_turbo(self, query: mx.array) -> mx.array:
+        """Attention with TurboQuant far tier: dequant then SDPA."""
+        from .turbo_quantize import turbo_dequant_keys, turbo_dequant_values
+
+        tc = self._turbo_constants
+        far_k_fp = turbo_dequant_keys(
+            self.turbo_far_k_indices, self.turbo_far_k_signs,
+            self.turbo_far_k_norm, self.turbo_far_k_gamma, tc,
+        )
+        far_v_fp = turbo_dequant_values(
+            self.turbo_far_v_packed, self.turbo_far_v_scale,
+        )
+
+        eff_k = self.effective_near_k
+        eff_v = self.effective_near_v
+        all_k = mx.concatenate([eff_k, far_k_fp], axis=2)
+        all_v = mx.concatenate([eff_v, far_v_fp], axis=2)
+
+        q_dtype = query.dtype
+        if all_k.dtype != q_dtype:
+            all_k = all_k.astype(q_dtype)
+            all_v = all_v.astype(q_dtype)
+
+        n_q_heads = query.shape[1]
+        n_kv_heads = all_k.shape[1]
+        if n_q_heads != n_kv_heads:
+            assert n_q_heads % n_kv_heads == 0
+            group_size = n_q_heads // n_kv_heads
+            all_k = mx.repeat(all_k, group_size, axis=1)
+            all_v = mx.repeat(all_v, group_size, axis=1)
+
+        scale = 1.0 / math.sqrt(query.shape[-1])
+        return _original_sdpa(query, all_k, all_v, scale=scale)
+
     def _ensure_kcache(self):
         """Build kernel cache on first call."""
         if self._kcache is not None:
@@ -269,7 +324,25 @@ class MLXFoveatedLayer:
         empty_dv = mx.zeros((B, H_kv, 0, D), dtype=mx.float16)
         mx.eval(empty_dk, empty_dv)
 
-        if _cpp_available:
+        if _cpp_available and self.compress_method == "turbo" and _TurboFoveatedHandle is not None:
+            tc = self._turbo_constants
+            self._kcache = {
+                "cpp_handle": _TurboFoveatedHandle(
+                    self.near_k, self.near_v,
+                    self.turbo_far_k_indices, self.turbo_far_k_signs,
+                    self.turbo_far_k_norm, self.turbo_far_k_gamma,
+                    self.turbo_far_v_packed, self.turbo_far_v_scale,
+                    self.near_valid,
+                    tc.Pi, tc.S, tc.centroids,
+                    spike_margin=10.0,
+                    metallib_path=_metallib_path,
+                ),
+                "B": B,
+                "H_kv": H_kv,
+                "D": D,
+                "empty_decode": (empty_dk, empty_dv),
+            }
+        elif _cpp_available:
             self._kcache = {
                 "cpp_handle": _FoveatedHandle(
                     self.near_k,
@@ -426,12 +499,22 @@ class MLXFoveatedLayer:
         return mx.mean(q.reshape(q.shape[0], n_kv, group_size, q.shape[-1]), axis=2)
 
     def memory_bytes(self) -> dict:
-        def _bytes(arr: mx.array) -> int:
-            return arr.size * arr.dtype.size
+        def _bytes(arr: Optional[mx.array]) -> int:
+            return arr.size * arr.dtype.size if arr is not None else 0
 
         near = _bytes(self.near_k) + _bytes(self.near_v)
-        far = (_bytes(self.far_k) + _bytes(self.far_v)
-               + _bytes(self.far_v_scale) + _bytes(self.far_v_zero))
+        if self.compress_method == "turbo":
+            far = (
+                _bytes(self.turbo_far_k_indices)
+                + _bytes(self.turbo_far_k_signs)
+                + _bytes(self.turbo_far_k_norm)
+                + _bytes(self.turbo_far_k_gamma)
+                + _bytes(self.turbo_far_v_packed)
+                + _bytes(self.turbo_far_v_scale)
+            )
+        else:
+            far = (_bytes(self.far_k) + _bytes(self.far_v)
+                   + _bytes(self.far_v_scale) + _bytes(self.far_v_zero))
         archive = _bytes(self.archive_k) + _bytes(self.archive_v)
         return {
             "near": near,
@@ -557,7 +640,7 @@ class MLXFoveatedKVCache:
         if not self._prefill_keys:
             return {"compressed": False}
 
-        if _cpp_available and _CompressHandle is not None:
+        if _cpp_available and _CompressHandle is not None and self.cfg.compress_method == "fp8":
             return self._compress_cpp()
 
         total_before = 0
@@ -781,9 +864,36 @@ class MLXFoveatedKVCache:
         # Archive: fp16 originals of far tokens for promotion
         arc_k, arc_v = far_k_fp, far_v_fp
 
-        # Far K: fp16 → fp8 E4M3
-        # Far V: fp16 → int4 per-token (nibble-packed + scale/zero)
-        if far_k_fp.shape[2] > 0:
+        # Compress far tier based on method
+        turbo_fields = {}
+        if cfg.compress_method == "turbo" and far_k_fp.shape[2] > 0:
+            from .turbo_constants import get_turbo_constants
+            from .turbo_quantize import turbo_compress_keys, turbo_compress_values
+
+            tc = get_turbo_constants(D)
+            tk_idx, tk_signs, tk_norm, tk_gamma = turbo_compress_keys(
+                far_k_fp.astype(mx.float16), tc
+            )
+            tv_packed, tv_scale = turbo_compress_values(
+                far_v_fp.astype(mx.float16)
+            )
+            turbo_fields = {
+                "compress_method": "turbo",
+                "turbo_far_k_indices": tk_idx,
+                "turbo_far_k_signs": tk_signs,
+                "turbo_far_k_norm": tk_norm,
+                "turbo_far_k_gamma": tk_gamma,
+                "turbo_far_v_packed": tv_packed,
+                "turbo_far_v_scale": tv_scale,
+                "_turbo_constants": tc,
+            }
+            # Set fp8/int4 fields to empty (not used in turbo mode)
+            far_k = mx.zeros((B, H, 0, D), dtype=mx.uint8)
+            far_v = mx.zeros((B, H, 0, D // 2), dtype=mx.uint8)
+            far_v_scale = mx.zeros((B, H, 0), dtype=mx.float16)
+            far_v_zero = mx.zeros((B, H, 0), dtype=mx.float16)
+        elif far_k_fp.shape[2] > 0:
+            # Default: fp8 E4M3 K + int4 per-token V
             far_k = _fp16_to_e4m3(far_k_fp.astype(mx.float16))
             far_v, far_v_scale, far_v_zero = _quantize_int4_per_token(
                 far_v_fp.astype(mx.float16)
@@ -806,13 +916,17 @@ class MLXFoveatedKVCache:
         near_idx = mx.concatenate([near_idx, pad_idx], axis=-1)
         near_valid = mx.full((H,), R_actual, dtype=mx.int32)
 
-        mx.eval(
+        eval_arrays = [
             near_k, near_v, near_idx, near_valid,
             far_k, far_v, far_v_scale, far_v_zero, far_idx,
             arc_k, arc_v,
-        )
+        ]
+        for f in turbo_fields.values():
+            if isinstance(f, mx.array):
+                eval_arrays.append(f)
+        mx.eval(*eval_arrays)
 
-        return MLXFoveatedLayer(
+        layer = MLXFoveatedLayer(
             near_k=near_k,
             near_v=near_v,
             near_idx=near_idx,
@@ -825,7 +939,9 @@ class MLXFoveatedKVCache:
             archive_v=arc_v,
             archive_idx=far_idx,
             near_valid=near_valid,
+            **turbo_fields,
         )
+        return layer
 
     def attend(self, layer_idx: int, query: mx.array) -> mx.array:
         layer = self.layers[layer_idx]

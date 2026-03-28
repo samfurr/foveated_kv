@@ -37,13 +37,31 @@ Multiple recent works (KIVI, LeanKV, KV-AdaQuant, AsymKV) independently discover
 
 FoveatedKV uses fp8 E4M3 for keys and INT4 for values in the far tier. The fp8 LUT enables a single shared-memory read per element vs per-channel scale/zero arithmetic.
 
-### Optional: TurboQuant (4x compression)
+### Optional: TurboQuant (3.2x compression)
 
-TurboQuant (ICLR 2026) provides ~4x compression via:
+TurboQuant (ICLR 2026) provides ~3.2x compression via:
 - **Keys**: 3.25 bits/dim — Lloyd-Max codebook (2 bits) + QJL residual correction (1 bit)
 - **Values**: 2 bits/dim — symmetric group quantization
 
 Enable with `MLXTierConfig(compress_method="turbo")`. TurboQuant compresses keys via random rotation + scalar quantization, with a Quantized Johnson-Lindenstrauss correction that provably eliminates bias in the attention scores.
+
+| Method | Compression | Cosine vs Exact | Far tier bytes/token (D=128) |
+|--------|-------------|-----------------|------------------------------|
+| fp8 K + int4 V (default) | 2.02x | 0.995 | 196 B |
+| TurboQuant (opt-in) | 3.21x | 0.889 | 92 B |
+
+TurboQuant trades ~10% cosine fidelity for 60% more memory savings. The fused Metal kernel computes attention scores directly on compressed data via codebook lookup + QJL sign inner product — no full dequantization needed.
+
+Kernel speed (7B shapes, single layer):
+
+| Context | fp16 SDPA | fp8 Fused | TurboQuant Fused |
+|---------|-----------|-----------|------------------|
+| 1K | 1.11 ms | 0.98 ms (1.1x) | **0.65 ms (1.7x)** |
+| 4K | 2.27 ms | 1.10 ms (2.1x) | **1.28 ms (1.8x)** |
+| 8K | 3.96 ms | 1.70 ms (2.3x) | **2.09 ms (1.9x)** |
+| 16K | 7.97 ms | 3.06 ms (2.6x) | **3.50 ms (2.3x)** |
+
+TurboQuant reads ~2.5x fewer bytes than fp8 from the far tier, giving strong speedups especially at short-to-medium contexts. Query rotation is pre-computed via MLX matmul in C++ (no Python overhead).
 
 ## What's Novel
 
@@ -114,10 +132,11 @@ On memory-constrained hardware, FoveatedKV extends context beyond the OOM wall:
 
 | Context | Standard tok/s | Foveated tok/s | Speedup | Memory Saved |
 |---------|---------------|----------------|---------|-------------|
-| 512 | 0.7 | 1.6 | **2.3x** | — |
-| 1024 | 0.6 | 1.0 | **1.7x** | 50 MB |
-| 2048 | 0.2 | 0.4 | **2.0x** | 101 MB |
-| 3072 | OOM | 0.3 | — | 151 MB |
+| 512 | 0.3 | 0.6 | **2.0x** | 14.9 MB |
+| 1024 | 0.1 | 0.8 | **8.0x** | 29.7 MB |
+| 2048+ | OOM | — | — | — |
+
+Both are swap-bound on 8GB. Foveated wins by reading half the KV cache bytes — the 2x compression keeps more data in physical memory.
 
 ### Quality
 
@@ -218,7 +237,12 @@ from foveated_kv.mlx_generate import generate_fused
 from foveated_kv.mlx_foveated import MLXTierConfig
 
 model, tokenizer = load("mlx-community/Qwen2.5-0.5B-Instruct-4bit")
-cfg = MLXTierConfig()  # defaults to 10% near
+
+# Default: fp8 K + int4 V (2x compression, 0.995 cosine)
+cfg = MLXTierConfig()
+
+# TurboQuant: 3.2x compression, 0.89 cosine
+# cfg = MLXTierConfig(compress_method="turbo")
 
 text, stats = generate_fused(
     model, tokenizer,

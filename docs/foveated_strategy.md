@@ -141,7 +141,7 @@ bf16 (Qwen2.5-0.5B-Instruct-bf16):
 
 Note: fused path is slower on 0.5B due to Python SDPA interceptor overhead.
 The value is 2x memory compression enabling longer contexts, and on
-memory-constrained 7B (8GB Mac), foveated is 2.3x faster because standard
+memory-constrained 7B (8GB Mac), foveated is 2-8x faster because standard
 is swap-bound. The kernel itself is 1.7-3.3x faster in isolation.
 ```
 

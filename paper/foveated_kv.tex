@@ -613,13 +613,14 @@ with 2K context truncation; full-length evaluation on larger models
 with RULER or complete LongBench would strengthen the claims.
 
 \paragraph{Hardware.} All results are on Apple M2 8GB. End-to-end
-throughput is measured on a 0.5B model where inference is not
-swap-bound; the speedups (1.03--1.45$\times$) reflect genuine bandwidth
-savings rather than memory-pressure effects. On machines with higher
-memory bandwidth, the absolute tok/s would increase but the relative
-speedup should persist since it derives from reading 2$\times$ fewer KV
-bytes. The kernel bandwidth advantage (up to 3.34$\times$ at 16K on 7B
-shapes) is hardware-independent.
+throughput on the 0.5B model shows foveated is 0.63--0.81$\times$
+standard speed due to Python SDPA interceptor overhead that dominates
+on small models. On the actual target scenario---Qwen2.5-7B-Instruct-4bit
+on 8GB---foveated is 2--8$\times$ faster (0.6 vs 0.3 tok/s at 512
+context; 0.8 vs 0.1 tok/s at 1K) because the 2$\times$ memory
+compression keeps more data in physical memory, reducing swap pressure.
+The kernel bandwidth advantage (up to 3.34$\times$ at 16K on 7B shapes)
+is hardware-independent.
 
 \paragraph{Comparison scope.} We do not directly benchmark against
 LeanKV~\cite{leankv} or KV-AdaQuant~\cite{kvadaquant}. Kernel-level

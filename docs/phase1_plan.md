@@ -84,7 +84,7 @@ End-to-end decode went from 3-5x SLOWER than standard to competitive on 0.5B:
 
 - 4-bit model (Qwen2.5-0.5B-Instruct-4bit): 96-98 tok/s fused vs 107-135 standard (0.63-0.81x — slower due to Python SDPA interceptor overhead on this small model)
 - bf16 model (Qwen2.5-0.5B-Instruct-bf16): 53-55 tok/s fused vs 60-66 standard (0.83-0.90x)
-- On memory-constrained 7B (8GB Mac, swap-bound): foveated is 2.3x faster because standard is swap-bound
+- On memory-constrained 7B (8GB Mac, swap-bound): foveated is 2-8x faster because the 2x memory compression reduces swap pressure (0.6 vs 0.3 tok/s at 512, 0.8 vs 0.1 tok/s at 1K)
 
 Root causes of old slowdown (all fixed):
 - Dtype mismatch: fp16 cache vs bf16 model causing silent conversion overhead

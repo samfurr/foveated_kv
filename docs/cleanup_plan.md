@@ -36,7 +36,7 @@ Every meaningful claim maps to working code, tests, and current results.
 | Kernel up to 3.34x at 16K (7B shapes) | `implemented` | `benchmark_mlx_throughput.py` results |
 | End-to-end decode 0.63-0.81x on 4-bit 0.5B (slower due to interceptor overhead) | `implemented` | `benchmark_mlx_model.py` results |
 | End-to-end decode 0.83-0.90x on bf16 0.5B (slower due to interceptor overhead) | `implemented` | `benchmark_mlx_model.py` results |
-| End-to-end 2.3x faster on 7B 8GB Mac (swap-bound baseline) | `implemented` | `benchmark_mlx_model.py` results |
+| End-to-end 2-8x faster on 7B 8GB Mac (swap-bound baseline, 0.6 vs 0.3 at 512, 0.8 vs 0.1 at 1K) | `implemented` | `benchmark_mlx_model.py` results |
 | TurboQuant ~4x compression (Python path) | `implemented` | `turbo_quantize.py`, 24 tests |
 | TurboQuant Metal kernel | `partial` | Known accuracy bug in Metal path |
 | Asymmetric K/V is critical (3.6x ablation) | `implemented` | `benchmark_mlx_ablation.py` results |

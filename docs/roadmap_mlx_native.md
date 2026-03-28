@@ -249,7 +249,7 @@ overhead is from the Python SDPA interceptor, which dominates on small models:
 
 Note: fused path is slower end-to-end on 0.5B due to Python SDPA interceptor
 overhead. The kernel is 1.7-3.3x faster in isolation. On memory-constrained 7B
-(8GB Mac), foveated is 2.3x faster because standard is swap-bound.
+(8GB Mac), foveated is 2-8x faster because the 2x memory compression reduces swap pressure (0.6 vs 0.3 tok/s at 512, 0.8 vs 0.1 tok/s at 1K).
 
 **Kernel microbenchmarks (7B shapes):**
 

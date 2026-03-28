@@ -75,7 +75,7 @@ Metal fused kernel speed vs standard fp16 SDPA.
 Note: fused path is slower end-to-end on 0.5B due to Python SDPA interceptor
 overhead. The kernel is 1.7-3.3x faster in isolation. The value proposition is
 2x memory compression enabling longer contexts, and on memory-constrained 7B
-(8GB Mac, swap-bound), foveated is 2.3x faster.
+(8GB Mac, swap-bound), foveated is 2-8x faster (0.6 vs 0.3 tok/s at 512, 0.8 vs 0.1 at 1K).
 
 Memory compression: 2.02x at all context lengths.
 

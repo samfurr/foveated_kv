@@ -261,7 +261,7 @@ void TurboPrimitive::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs)
 {
-    // inputs: [blob, query_flat, decode_k, decode_v, Pi, S_mat, centroids]
+    // inputs: [blob, query_flat, decode_k, decode_v, q_rot_flat, q_sketch_flat, centroids]
     auto& s = stream();
     auto& d = metal::device(s.device);
 
@@ -285,7 +285,7 @@ void TurboPrimitive::eval_gpu(
     enc.set_bytes(params_, 7);
     enc.set_bytes(blob_offsets_, 8);
 
-    // Pi, S_mat → buffers 9-10
+    // q_rot, q_sketch → buffers 9-10
     enc.set_input_array(inputs[4], 9);
     enc.set_input_array(inputs[5], 10);
 
@@ -413,6 +413,12 @@ std::vector<array> TurboFoveatedHandle::operator()(
     auto dv = (decode_v.dtype() == float16) ? decode_v : astype(decode_v, float16);
 
     int H_q = q.shape(1);
+
+    // Pre-compute rotated/sketched query on host (MLX matmul, pipelines well)
+    // q_rot = q @ Pi^T, q_sketch = S @ q — both (B, H_q, 1, D) float32
+    auto q_f32 = astype(squeeze(q, 2), float32);  // (B, H_q, D)
+    auto q_rot = matmul(q_f32, transpose(Pi_));    // (B, H_q, D)
+    auto q_sketch = matmul(q_f32, transpose(S_mat_));  // (B, H_q, D)
     int n_decode = dk.shape(2);
     int total_bh_q = B_ * H_q;
     int S_total = N_static_ + n_decode;
@@ -473,11 +479,15 @@ std::vector<array> TurboFoveatedHandle::operator()(
         total_bh_q,
         num_splits);
 
+    // Flatten q_rot and q_sketch to (total_bh_q, D) like q_flat
+    auto q_rot_flat = reshape(q_rot, {total_bh_q, D_});
+    auto q_sketch_flat = reshape(q_sketch, {total_bh_q, D_});
+
     return array::make_arrays(
         {{B_, H_q, 1, D_}, {B_, H_q}, {B_, H_q}},
         {float16, int32, int32},
         prim,
-        {blob_, q_flat, dk, dv, Pi_, S_mat_, centroids_});
+        {blob_, q_flat, dk, dv, q_rot_flat, q_sketch_flat, centroids_});
 }
 
 BlobWriteInfo TurboFoveatedHandle::get_blob_info() const {

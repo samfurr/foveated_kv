@@ -568,8 +568,8 @@ void foveated_2tier_turbo(
     device int32_t* spike_tokens            [[buffer(6)]],
     const constant FoveatedParams& params   [[buffer(7)]],
     const constant TurboBlobOffsets& offsets [[buffer(8)]],
-    const device float* Pi                  [[buffer(9)]],
-    const device float* S_mat               [[buffer(10)]],
+    const device float* q_rot_buf           [[buffer(9)]],
+    const device float* q_sketch_buf        [[buffer(10)]],
     const constant float* centroids         [[buffer(11)]],
     uint tg_pos [[threadgroup_position_in_grid]],
     uint thread_pos [[thread_position_in_threadgroup]])
@@ -614,42 +614,25 @@ void foveated_2tier_turbo(
     const uint bh_kv     = batch_idx * H_KV + kv_head;
 
     // ================================================================
-    // Load query and pre-compute q_rot = q @ Pi^T and q_sketch = S @ q
-    // These are amortized across the entire far sequence.
+    // Load query, pre-rotated q_rot, and pre-sketched q_sketch.
+    // q_rot = q @ Pi^T and q_sketch = S @ q are pre-computed in C++
+    // via MLX matmul (pipelines well, no simd_shuffle needed).
     // ================================================================
     const float INV_SQRT_D = rsqrt((float)HEAD_DIM);
-    float q_raw[CPT];
-    for (uint c = 0; c < CPT; c++)
-        q_raw[c] = (float)query[bh_q * HEAD_DIM + lane_id * CPT + c];
 
     // q_reg = q * 1/sqrt(D) for near/decode attention
     float q_reg[CPT];
     for (uint c = 0; c < CPT; c++)
-        q_reg[c] = q_raw[c] * INV_SQRT_D;
+        q_reg[c] = (float)query[bh_q * HEAD_DIM + lane_id * CPT + c] * INV_SQRT_D;
 
-    // q_rot = q @ Pi^T: q_rot[i] = sum_j q[j] * Pi[i, j]
-    // Pi is row-major (D x D). Row i of Pi dotted with q gives element i.
-    // Each lane holds CPT elements of q starting at lane_id*CPT.
-    // For output element i = lane_id*CPT+c, we need row i of Pi.
+    // Load pre-computed q_rot and q_sketch from buffers
     float q_rot[CPT];
-    for (uint c = 0; c < CPT; c++) {
-        float dot = 0.0f;
-        uint i = lane_id * CPT + c;
-        for (uint qc = 0; qc < CPT; qc++)
-            dot += q_raw[qc] * Pi[i * HEAD_DIM + lane_id * CPT + qc];
-        q_rot[c] = simd_sum(dot);
-    }
+    for (uint c = 0; c < CPT; c++)
+        q_rot[c] = q_rot_buf[bh_q * HEAD_DIM + lane_id * CPT + c];
 
-    // q_sketch[c] = sum_j(S[lane_id*CPT+c, j] * q[j])
-    // NOT scaled by 1/sqrt(D) — the QJL coefficient already accounts for it.
     float q_sketch[CPT];
-    for (uint c = 0; c < CPT; c++) {
-        float dot = 0.0f;
-        uint row = lane_id * CPT + c;
-        for (uint qc = 0; qc < CPT; qc++)
-            dot += S_mat[row * HEAD_DIM + lane_id * CPT + qc] * q_raw[qc];
-        q_sketch[c] = simd_sum(dot);
-    }
+    for (uint c = 0; c < CPT; c++)
+        q_sketch[c] = q_sketch_buf[bh_q * HEAD_DIM + lane_id * CPT + c];
 
     // Load centroids into registers (only 4 values)
     float cb[4];

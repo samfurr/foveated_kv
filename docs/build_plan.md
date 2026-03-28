@@ -74,7 +74,7 @@ The kernel reads 2-4x fewer bytes from memory (fp8/INT4 vs fp16).
 The fused path is slower end-to-end on this small 0.5B model due to Python
 SDPA interceptor overhead. The kernel itself is 1.7-3.3x faster in isolation.
 The value proposition is 2x memory compression enabling longer contexts, and
-on memory-constrained 7B (8GB Mac, swap-bound), foveated is 2.3x faster.
+on memory-constrained 7B (8GB Mac, swap-bound), foveated is 2-8x faster (0.6 vs 0.3 tok/s at 512, 0.8 vs 0.1 at 1K).
 
 Previous versions were 3-5x SLOWER end-to-end due to:
 - Dtype mismatch (fp16 cache vs bf16 model causing silent conversion overhead)

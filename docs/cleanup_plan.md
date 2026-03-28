@@ -34,8 +34,9 @@ Every meaningful claim maps to working code, tests, and current results.
 | 100% needle retrieval (55/55) | `implemented` | `benchmark_mlx_needle_heatmap.py` results |
 | Non-accumulating PPL (0.999-1.025x) | `implemented` | `benchmark_mlx_ablation.py` results |
 | Kernel up to 3.34x at 16K (7B shapes) | `implemented` | `benchmark_mlx_throughput.py` results |
-| End-to-end decode 1.03-1.45x faster (4-bit 7B) | `implemented` | `benchmark_mlx_model.py` results |
-| End-to-end decode 1.04-1.14x faster (bf16 0.5B) | `implemented` | `benchmark_mlx_model.py` results |
+| End-to-end decode 0.63-0.81x on 4-bit 0.5B (slower due to interceptor overhead) | `implemented` | `benchmark_mlx_model.py` results |
+| End-to-end decode 0.83-0.90x on bf16 0.5B (slower due to interceptor overhead) | `implemented` | `benchmark_mlx_model.py` results |
+| End-to-end 2.3x faster on 7B 8GB Mac (swap-bound baseline) | `implemented` | `benchmark_mlx_model.py` results |
 | TurboQuant ~4x compression (Python path) | `implemented` | `turbo_quantize.py`, 24 tests |
 | TurboQuant Metal kernel | `partial` | Known accuracy bug in Metal path |
 | Asymmetric K/V is critical (3.6x ablation) | `implemented` | `benchmark_mlx_ablation.py` results |

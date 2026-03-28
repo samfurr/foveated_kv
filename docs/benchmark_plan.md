@@ -60,12 +60,22 @@ Metal fused kernel speed vs standard fp16 SDPA.
 | 16K | 9.67 ms | 2.90 ms | 3.34x |
 | 32K | 15.19 ms | 5.18 ms | 2.93x |
 
-**End-to-end decode performance:**
+**End-to-end decode performance (Qwen2.5-0.5B, M2 8GB):**
 
-| Model | Fused | Standard | Speedup |
-|-------|-------|----------|---------|
-| Qwen2.5-7B-Instruct-4bit | 150 tok/s | 130-146 tok/s | 1.03-1.45x |
-| Qwen2.5-0.5B-Instruct-bf16 | 67-69 tok/s | 60-66 tok/s | 1.04-1.14x |
+| Model | Context | Fused | Standard | Ratio |
+|-------|---------|-------|----------|-------|
+| Qwen2.5-0.5B-Instruct-4bit | 512 | 96 tok/s | 135 tok/s | 0.71x |
+| Qwen2.5-0.5B-Instruct-4bit | 1K | 97 tok/s | 131 tok/s | 0.74x |
+| Qwen2.5-0.5B-Instruct-4bit | 2K | 98 tok/s | 121 tok/s | 0.81x |
+| Qwen2.5-0.5B-Instruct-4bit | 4K | 67 tok/s | 107 tok/s | 0.63x |
+| Qwen2.5-0.5B-Instruct-bf16 | 512 | 55 tok/s | 66 tok/s | 0.83x |
+| Qwen2.5-0.5B-Instruct-bf16 | 1K | 53 tok/s | 64 tok/s | 0.83x |
+| Qwen2.5-0.5B-Instruct-bf16 | 2K | 54 tok/s | 60 tok/s | 0.90x |
+
+Note: fused path is slower end-to-end on 0.5B due to Python SDPA interceptor
+overhead. The kernel is 1.7-3.3x faster in isolation. The value proposition is
+2x memory compression enabling longer contexts, and on memory-constrained 7B
+(8GB Mac, swap-bound), foveated is 2.3x faster.
 
 Memory compression: 2.02x at all context lengths.
 

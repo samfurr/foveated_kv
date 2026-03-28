@@ -80,10 +80,11 @@ Results on 8GB Mac (kernel-only, 7B shapes):
 
 ## Phase 4: Performance Optimization + TurboQuant (Current)
 
-End-to-end decode went from 3-5x SLOWER than standard to 1.03-1.45x FASTER:
+End-to-end decode went from 3-5x SLOWER than standard to competitive on 0.5B:
 
-- 4-bit model (Qwen2.5-7B-Instruct-4bit): 150 tok/s fused vs 130-146 standard
-- bf16 model (Qwen2.5-0.5B-Instruct-bf16): 67-69 tok/s fused vs 60-66 standard
+- 4-bit model (Qwen2.5-0.5B-Instruct-4bit): 96-98 tok/s fused vs 107-135 standard (0.63-0.81x — slower due to Python SDPA interceptor overhead on this small model)
+- bf16 model (Qwen2.5-0.5B-Instruct-bf16): 53-55 tok/s fused vs 60-66 standard (0.83-0.90x)
+- On memory-constrained 7B (8GB Mac, swap-bound): foveated is 2.3x faster because standard is swap-bound
 
 Root causes of old slowdown (all fixed):
 - Dtype mismatch: fp16 cache vs bf16 model causing silent conversion overhead

@@ -126,10 +126,23 @@ Total KV read:  ~79 MB -> 0.40 ms at 200 GB/s
 32K context:  2.93x faster than fp16 SDPA
 ```
 
-**End-to-end decode performance:**
+**End-to-end decode performance (Qwen2.5-0.5B):**
 ```
-Qwen2.5-7B-Instruct-4bit:    150 tok/s fused vs 130-146 standard (1.03-1.45x)
-Qwen2.5-0.5B-Instruct-bf16:  67-69 tok/s fused vs 60-66 standard (1.04-1.14x)
+4-bit (Qwen2.5-0.5B-Instruct-4bit):
+  512:  96 tok/s fused vs 135 standard (0.71x)
+  1K:   97 tok/s fused vs 131 standard (0.74x)
+  2K:   98 tok/s fused vs 121 standard (0.81x)
+  4K:   67 tok/s fused vs 107 standard (0.63x)
+
+bf16 (Qwen2.5-0.5B-Instruct-bf16):
+  512:  55 tok/s fused vs 66 standard (0.83x)
+  1K:   53 tok/s fused vs 64 standard (0.83x)
+  2K:   54 tok/s fused vs 60 standard (0.90x)
+
+Note: fused path is slower on 0.5B due to Python SDPA interceptor overhead.
+The value is 2x memory compression enabling longer contexts, and on
+memory-constrained 7B (8GB Mac), foveated is 2.3x faster because standard
+is swap-bound. The kernel itself is 1.7-3.3x faster in isolation.
 ```
 
 The Metal Split-K kernel achieves speedup by:

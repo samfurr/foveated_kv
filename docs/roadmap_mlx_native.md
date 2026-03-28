@@ -231,15 +231,25 @@ at runtime. No source strings stored in memory.
 
 The dispatch overhead optimizations, combined with fixing a dtype mismatch
 (fp16 cache vs bf16 model) and replacing the SDPA monkey-patch with direct
-attention module patching (`install_fused_attention`), eliminated the
-end-to-end slowdown entirely:
+attention module patching (`install_fused_attention`), reduced the old 3-5x
+end-to-end slowdown to a modest overhead on 0.5B (0.63-0.90x). Remaining
+overhead is from the Python SDPA interceptor, which dominates on small models:
 
-**End-to-end decode performance (tok/s):**
+**End-to-end decode performance (tok/s, Qwen2.5-0.5B on M2 8GB):**
 
-| Model | Fused | Standard | Speedup |
-|-------|-------|----------|---------|
-| 4-bit (Qwen2.5-7B-Instruct-4bit) | 150 tok/s | 130-146 tok/s | 1.03-1.45x |
-| bf16 (Qwen2.5-0.5B-Instruct-bf16) | 67-69 tok/s | 60-66 tok/s | 1.04-1.14x |
+| Model | Context | Fused | Standard | Ratio |
+|-------|---------|-------|----------|-------|
+| 4-bit (Qwen2.5-0.5B-Instruct-4bit) | 512 | 96 tok/s | 135 tok/s | 0.71x |
+| 4-bit (Qwen2.5-0.5B-Instruct-4bit) | 1K | 97 tok/s | 131 tok/s | 0.74x |
+| 4-bit (Qwen2.5-0.5B-Instruct-4bit) | 2K | 98 tok/s | 121 tok/s | 0.81x |
+| 4-bit (Qwen2.5-0.5B-Instruct-4bit) | 4K | 67 tok/s | 107 tok/s | 0.63x |
+| bf16 (Qwen2.5-0.5B-Instruct-bf16) | 512 | 55 tok/s | 66 tok/s | 0.83x |
+| bf16 (Qwen2.5-0.5B-Instruct-bf16) | 1K | 53 tok/s | 64 tok/s | 0.83x |
+| bf16 (Qwen2.5-0.5B-Instruct-bf16) | 2K | 54 tok/s | 60 tok/s | 0.90x |
+
+Note: fused path is slower end-to-end on 0.5B due to Python SDPA interceptor
+overhead. The kernel is 1.7-3.3x faster in isolation. On memory-constrained 7B
+(8GB Mac), foveated is 2.3x faster because standard is swap-bound.
 
 **Kernel microbenchmarks (7B shapes):**
 
@@ -251,7 +261,7 @@ end-to-end slowdown entirely:
 | 16K | 9.67 ms | 2.90 ms | 3.34x |
 | 32K | 15.19 ms | 5.18 ms | 2.93x |
 
-Key changes that unlocked the speedup:
+Key changes that eliminated the old 3-5x slowdown:
 - Direct attention module patching replaced SDPA monkey-patch (eliminates interceptor overhead)
 - Blob passed as tracked input array (`set_input_array`) instead of raw pointer (`set_buffer`)
 - Lazy decode buffer concatenation (flat list + lazy concat vs O(n) chained concat)

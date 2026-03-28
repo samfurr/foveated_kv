@@ -98,7 +98,7 @@ Current repo status:
 All MLX benchmarks (`benchmark_mlx_*.py`) follow this methodology:
 
 1. **Data loading**: JSONL directly from HuggingFace datasets
-2. **Model**: mlx-lm loaded models (Qwen2.5-0.5B-Instruct-4bit, Qwen2.5-7B-Instruct-4bit)
+2. **Model**: mlx-lm loaded models (Qwen2.5-0.5B-Instruct-4bit, Qwen2.5-0.5B-Instruct-bf16)
 3. **Scoring**: Official THUDM scoring functions for LongBench tasks
 4. **Timing**: MLX eval + sync for kernel benchmarks
 5. **Memory**: Actual tensor allocation measurement

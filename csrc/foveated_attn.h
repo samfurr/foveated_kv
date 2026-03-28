@@ -50,16 +50,12 @@ class FoveatedPrimitive : public mlx::core::Primitive {
     FoveatedPrimitive(
         mlx::core::Stream stream,
         MTL::ComputePipelineState* pipeline,
-        const MTL::Buffer* blob_buf,
-        int64_t blob_offset,
         BlobOffsets blob_offsets,
         FoveatedParams params,
         int total_bh_q,
         int num_splits)
         : Primitive(stream),
           pipeline_(pipeline),
-          blob_buf_(blob_buf),
-          blob_offset_(blob_offset),
           blob_offsets_(blob_offsets),
           params_(params),
           total_bh_q_(total_bh_q),
@@ -86,8 +82,6 @@ class FoveatedPrimitive : public mlx::core::Primitive {
 
  private:
     MTL::ComputePipelineState* pipeline_;
-    const MTL::Buffer* blob_buf_;
-    int64_t blob_offset_;
     BlobOffsets blob_offsets_;
     FoveatedParams params_;
     int total_bh_q_;
@@ -123,8 +117,6 @@ class FoveatedHandle {
 
  private:
     mlx::core::array blob_;
-    const MTL::Buffer* blob_buf_;
-    int64_t blob_offset_;
     BlobOffsets blob_offsets_;
 
     std::unordered_map<uint64_t, MTL::ComputePipelineState*> pipelines_;
@@ -165,16 +157,12 @@ class TurboPrimitive : public mlx::core::Primitive {
     TurboPrimitive(
         mlx::core::Stream stream,
         MTL::ComputePipelineState* pipeline,
-        const MTL::Buffer* blob_buf,
-        int64_t blob_offset,
         TurboBlobOffsets blob_offsets,
         FoveatedParams params,
         int total_bh_q,
         int num_splits)
         : Primitive(stream),
           pipeline_(pipeline),
-          blob_buf_(blob_buf),
-          blob_offset_(blob_offset),
           blob_offsets_(blob_offsets),
           params_(params),
           total_bh_q_(total_bh_q),
@@ -239,8 +227,6 @@ class TurboFoveatedHandle {
 
  private:
     mlx::core::array blob_;
-    const MTL::Buffer* blob_buf_;
-    int64_t blob_offset_;
     TurboBlobOffsets blob_offsets_;
 
     // Shared constant arrays (not in blob — passed as separate buffers)

@@ -46,6 +46,7 @@ void FoveatedPrimitive::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs)
 {
+    // inputs: [blob, query_flat, decode_k, decode_v]
     auto& s = stream();
     auto& d = metal::device(s.device);
 
@@ -55,10 +56,12 @@ void FoveatedPrimitive::eval_gpu(
     auto& enc = d.get_command_encoder(s.index);
     enc.set_compute_pipeline_state(pipeline_);
 
-    enc.set_buffer(blob_buf_, 0, blob_offset_);
+    // Blob as tracked input array — enables dependency tracking + pipelining
+    enc.set_input_array(inputs[0], 0);
 
-    for (int i = 0; i < (int)inputs.size(); i++)
-        enc.set_input_array(inputs[i], 1 + i);
+    // query, decode_k, decode_v
+    for (int i = 1; i < (int)inputs.size(); i++)
+        enc.set_input_array(inputs[i], i);
 
     enc.set_output_array(outputs[0], 4);
     enc.set_output_array(outputs[1], 5);
@@ -137,7 +140,6 @@ FoveatedHandle::FoveatedHandle(
     float spike_margin,
     const std::string& metallib_path)
     : blob_(array({1}, uint8)),
-      blob_buf_(nullptr), blob_offset_(0),
       B_(near_k.shape(0)), H_kv_(near_k.shape(1)), D_(near_k.shape(3)),
       N_near_(near_k.shape(2)), N_far_(far_k.shape(2)),
       N_static_(near_k.shape(2) + far_k.shape(2)),
@@ -149,9 +151,6 @@ FoveatedHandle::FoveatedHandle(
 
     auto layout = build_blob(blob_, nk, nv, far_k, far_v,
                              far_v_scale, far_v_zero, near_valid);
-
-    blob_buf_ = static_cast<const MTL::Buffer*>(blob_.buffer().ptr());
-    blob_offset_ = blob_.offset();
 
     blob_offsets_.near_k      = layout.near_k;
     blob_offsets_.near_v      = layout.near_v;
@@ -228,8 +227,6 @@ std::vector<array> FoveatedHandle::operator()(
     auto prim = std::make_shared<FoveatedPrimitive>(
         default_stream(Device::gpu),
         pipeline,
-        blob_buf_,
-        blob_offset_,
         blob_offsets_,
         params,
         total_bh_q,
@@ -239,7 +236,7 @@ std::vector<array> FoveatedHandle::operator()(
         {{B_, H_q, 1, D_}, {B_, H_q}, {B_, H_q}},
         {float16, int32, int32},
         prim,
-        {q_flat, dk, dv});
+        {blob_, q_flat, dk, dv});
 }
 
 BlobWriteInfo FoveatedHandle::get_blob_info() const {
@@ -264,7 +261,7 @@ void TurboPrimitive::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs)
 {
-    // inputs: [query_flat, decode_k, decode_v, Pi, S_mat, centroids]
+    // inputs: [blob, query_flat, decode_k, decode_v, Pi, S_mat, centroids]
     auto& s = stream();
     auto& d = metal::device(s.device);
 
@@ -274,25 +271,26 @@ void TurboPrimitive::eval_gpu(
     auto& enc = d.get_command_encoder(s.index);
     enc.set_compute_pipeline_state(pipeline_);
 
-    enc.set_buffer(blob_buf_, 0, blob_offset_);
+    // Blob as tracked input array
+    enc.set_input_array(inputs[0], 0);
 
     // query, decode_k, decode_v → buffers 1-3
-    for (int i = 0; i < 3; i++)
-        enc.set_input_array(inputs[i], 1 + i);
+    for (int i = 1; i <= 3; i++)
+        enc.set_input_array(inputs[i], i);
 
-    enc.set_output_array(outputs[0], 4);   // out
-    enc.set_output_array(outputs[1], 5);   // spike_flags
-    enc.set_output_array(outputs[2], 6);   // spike_tokens
+    enc.set_output_array(outputs[0], 4);
+    enc.set_output_array(outputs[1], 5);
+    enc.set_output_array(outputs[2], 6);
 
     enc.set_bytes(params_, 7);
     enc.set_bytes(blob_offsets_, 8);
 
-    // Pi, S_mat → buffers 9-10 (device memory)
-    enc.set_input_array(inputs[3], 9);
-    enc.set_input_array(inputs[4], 10);
+    // Pi, S_mat → buffers 9-10
+    enc.set_input_array(inputs[4], 9);
+    enc.set_input_array(inputs[5], 10);
 
-    // centroids → buffer 11 (constant memory, 4 floats = 16 bytes)
-    const auto& cents = inputs[5];
+    // centroids → buffer 11 (constant memory)
+    const auto& cents = inputs[6];
     enc.set_bytes(cents.data<float>(), cents.nbytes(), 11);
 
     enc.dispatch_threadgroups(
@@ -374,7 +372,6 @@ TurboFoveatedHandle::TurboFoveatedHandle(
     float spike_margin,
     const std::string& metallib_path)
     : blob_(array({1}, uint8)),
-      blob_buf_(nullptr), blob_offset_(0),
       Pi_(astype(Pi, float32)),
       S_mat_(astype(S_mat, float32)),
       centroids_(astype(centroids, float32)),
@@ -392,9 +389,6 @@ TurboFoveatedHandle::TurboFoveatedHandle(
                                    far_k_norm, far_k_gamma,
                                    far_v_packed, far_v_scale,
                                    near_valid);
-
-    blob_buf_ = static_cast<const MTL::Buffer*>(blob_.buffer().ptr());
-    blob_offset_ = blob_.offset();
 
     blob_offsets_.near_k        = layout.near_k;
     blob_offsets_.near_v        = layout.near_v;
@@ -474,8 +468,6 @@ std::vector<array> TurboFoveatedHandle::operator()(
     auto prim = std::make_shared<TurboPrimitive>(
         default_stream(Device::gpu),
         pipeline,
-        blob_buf_,
-        blob_offset_,
         blob_offsets_,
         params,
         total_bh_q,
@@ -485,7 +477,7 @@ std::vector<array> TurboFoveatedHandle::operator()(
         {{B_, H_q, 1, D_}, {B_, H_q}, {B_, H_q}},
         {float16, int32, int32},
         prim,
-        {q_flat, dk, dv, Pi_, S_mat_, centroids_});
+        {blob_, q_flat, dk, dv, Pi_, S_mat_, centroids_});
 }
 
 BlobWriteInfo TurboFoveatedHandle::get_blob_info() const {

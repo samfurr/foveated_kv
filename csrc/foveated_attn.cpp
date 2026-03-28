@@ -166,6 +166,9 @@ std::vector<array> FoveatedHandle::operator()(
     const array& query,
     const array& decode_k, const array& decode_v)
 {
+    // Query cast to fp16 for kernel; output is fp16, caller casts if needed.
+    // The fp16→bf16 cast in the interceptor also acts as a native MLX graph
+    // node that enables pipelining with downstream FFN ops.
     auto q = (query.dtype() == float16) ? query : astype(query, float16);
     auto dk = (decode_k.dtype() == float16) ? decode_k : astype(decode_k, float16);
     auto dv = (decode_v.dtype() == float16) ? decode_v : astype(decode_v, float16);
@@ -188,7 +191,7 @@ std::vector<array> FoveatedHandle::operator()(
         auto& d = metal::device(Device::gpu);
         auto* lib = d.get_library("foveated_attn", metallib_path_);
 
-        std::string kernel_name = "foveated_2tier_d" + std::to_string(D_)
+        std::string kernel_name = "foveated_2tier_f16_d" + std::to_string(D_)
                                 + "_s" + std::to_string(max_splits);
 
         uint32_t fc_vals[7] = {

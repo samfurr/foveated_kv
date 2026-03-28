@@ -178,14 +178,14 @@ inline void load_far_v(
 // Main kernel
 // ============================================================================
 
-template <int HEAD_DIM, int MAX_SPLITS>
+template <typename QT, int HEAD_DIM, int MAX_SPLITS>
 [[kernel, max_total_threads_per_threadgroup(MAX_SPLITS * 32)]]
 void foveated_2tier(
     const device uint8_t* blob              [[buffer(0)]],
-    const device half* query                [[buffer(1)]],
+    const device QT* query                  [[buffer(1)]],
     const device half* decode_k             [[buffer(2)]],
     const device half* decode_v             [[buffer(3)]],
-    device half* out                        [[buffer(4)]],
+    device QT* out                          [[buffer(4)]],
     device int32_t* spike_flags             [[buffer(5)]],
     device int32_t* spike_tokens            [[buffer(6)]],
     const constant FoveatedParams& params   [[buffer(7)]],
@@ -418,7 +418,7 @@ void foveated_2tier(
 
         float inv_l = (l_global > 0.0f) ? (1.0f / l_global) : 0.0f;
         for (uint c = 0; c < CPT; c++)
-            out[bh_q * HEAD_DIM + lane_id * CPT + c] = (half)(racc[c] * inv_l);
+            out[bh_q * HEAD_DIM + lane_id * CPT + c] = (QT)(racc[c] * inv_l);
 
         // Spike output: feeds the C++ promotion pipeline.
         // The pipeline filters via cooldown/dedup/budget, reads fp16 from
@@ -436,13 +436,15 @@ void foveated_2tier(
 // Template instantiations
 // ============================================================================
 
-#define INST(D, S) \
-template [[host_name("foveated_2tier_d" #D "_s" #S)]] \
-kernel void foveated_2tier<D, S>( \
-    const device uint8_t*, const device half*, const device half*, const device half*, \
-    device half*, device int32_t*, device int32_t*, \
+#define INST(QT, QN, D, S) \
+template [[host_name("foveated_2tier_" #QN "_d" #D "_s" #S)]] \
+kernel void foveated_2tier<QT, D, S>( \
+    const device uint8_t*, const device QT*, const device half*, const device half*, \
+    device QT*, device int32_t*, device int32_t*, \
     const constant FoveatedParams&, const constant BlobOffsets&, uint, uint);
 
-INST(64, 1) INST(64, 2) INST(64, 4) INST(64, 8) INST(64, 16)
-INST(128, 1) INST(128, 2) INST(128, 4) INST(128, 8) INST(128, 16)
+INST(half, f16, 64, 1) INST(half, f16, 64, 2) INST(half, f16, 64, 4) INST(half, f16, 64, 8) INST(half, f16, 64, 16)
+INST(half, f16, 128, 1) INST(half, f16, 128, 2) INST(half, f16, 128, 4) INST(half, f16, 128, 8) INST(half, f16, 128, 16)
+INST(bfloat, bf16, 64, 1) INST(bfloat, bf16, 64, 2) INST(bfloat, bf16, 64, 4) INST(bfloat, bf16, 64, 8) INST(bfloat, bf16, 64, 16)
+INST(bfloat, bf16, 128, 1) INST(bfloat, bf16, 128, 2) INST(bfloat, bf16, 128, 4) INST(bfloat, bf16, 128, 8) INST(bfloat, bf16, 128, 16)
 #undef INST
